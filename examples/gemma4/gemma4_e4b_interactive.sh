@@ -20,18 +20,17 @@
 # Gemma4Model.forward, so they are exercised on the training loss path.
 #
 # DDP=1, TP=PP=CP=1, no SP, bf16 full precision (no FP8/NVFP4).
-# Launch:  sbatch code_dev/scripts/gemma4_e4b_interactive.sh
+# Launch:  sbatch examples/gemma4/gemma4_e4b_interactive.sh
 # ============================================================================
 
 set -eu
 
-# Container launch idiom copied from code_dev/scripts/ic_run.sbatch (proven).
+# Proven container launch idiom.
 unset SLURM_CPUS_PER_TASK SLURM_TRES_PER_TASK SLURM_CPU_BIND SLURM_DISTRIBUTION
 
 IMAGE=/lustre/fsw/portfolios/coreai/projects/coreai_nvfm_llm/containers/nemo-25.11.nemotron_3_nano-mamba_ssm_2.3.0.sqsh
 ROOT=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/ataghibakhsh/Gemma4_mlm
 MLM=${ROOT}/Megatron-LM
-SCR=${ROOT}/code_dev/scripts
 RUN_DIR=${ROOT}/code_dev/shared-state/v7_run
 mkdir -p ${RUN_DIR}/triton_cache ${RUN_DIR}/checkpoints ${RUN_DIR}/data_cache
 

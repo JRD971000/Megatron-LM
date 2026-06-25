@@ -9,7 +9,7 @@
 #        --container-mounts=/lustre:/lustre,/home/ataghibakhsh:/home/ataghibakhsh \
 #        --no-container-mount-home --pty bash
 #   # then, from the prompt inside the container:
-#   bash code_dev/scripts/gemma4_e4b_load_interactive.sh
+#   bash examples/gemma4/gemma4_e4b_load_interactive.sh
 #
 # Unlike gemma4_e4b_interactive.sh (which is an sbatch + random-init smoke with a
 # shrunk FFN/vocab), this:
