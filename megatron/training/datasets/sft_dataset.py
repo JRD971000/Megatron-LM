@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
-import atexit, json
+import atexit
+import json
 from collections import Counter
 from typing import Any, Dict, Optional
 
@@ -46,6 +47,11 @@ class SFTLowLevelDataset:
 
     def __getitem__(self, idx: int) -> list:
         return self.dataset[idx]["messages"]
+
+    def get_tools(self, idx: int) -> Optional[list]:
+        """Return the optional per-record tool definitions (or None)."""
+        row = self.dataset[idx]
+        return row.get("tools")
 
 
 class SFTDataset(MegatronDataset):
@@ -93,7 +99,11 @@ class SFTDataset(MegatronDataset):
         tokenizer = self.config.tokenizer
         pack_length = self.config.sequence_length
 
-        merged_conversations = self.dataset[int(self.indices[idx % len(self.indices)])]
+        row_idx = int(self.indices[idx % len(self.indices)])
+        merged_conversations = self.dataset[row_idx]
+        # Optional per-record tool definitions (used by tool-calling chat templates,
+        # e.g. the Gemma4 assistant-masked format).
+        tools = self.dataset.get_tools(row_idx) if hasattr(self.dataset, "get_tools") else None
         split_conversations = self._split_conversations(merged_conversations)
 
         def extend_with_padding(tokens, targets, positions, pad_len):
@@ -111,7 +121,7 @@ class SFTDataset(MegatronDataset):
         for conversation in split_conversations:
 
             tokens, targets = tokenizer.tokenize_conversation(
-                conversation, return_target=True, add_generation_prompt=False
+                conversation, return_target=True, add_generation_prompt=False, tools=tools
             )
 
             tokens_list = tokens.tolist()
