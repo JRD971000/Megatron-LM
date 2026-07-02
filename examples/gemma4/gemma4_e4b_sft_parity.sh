@@ -16,14 +16,13 @@
 #     BACKEND=eager      bash examples/gemma4/gemma4_e4b_sft_parity.sh
 #     BACKEND=ffpa_flash bash examples/gemma4/gemma4_e4b_sft_parity.sh
 #
-# ---- I1/I2 DEPENDENCY -------------------------------------------------------
-# The gemma4 string field config.attention_backend ("eager"|"ffpa_flash") and its
-# CLI wiring are added by tasks I1/I2 (NOT the base --attention-backend enum, which
-# is TE's local/flash/fused selector -- a DIFFERENT knob). This tree does not carry
-# them yet, so by default (USE_BACKEND_FLAG=0) the run uses the eager default and
-# BACKEND only labels the output file. Once I1/I2 merge, set:
-#     USE_BACKEND_FLAG=1  BACKEND_FLAG="--<the-flag-I1/I2-added>"
-# to actually select ffpa_flash. STAGE 5 flips this on and confirms the flag name.
+# ---- backend selection ------------------------------------------------------
+# The gemma4 string field config.gemma4_attention_backend ("eager"|"ffpa_flash") is
+# selected by the --gemma4-attention-backend CLI arg on pretrain_gemma4.py (NOT the
+# base --attention-backend enum, which is TE's local/flash/fused selector -- a
+# DIFFERENT knob). By default (USE_BACKEND_FLAG=1) BACKEND is passed through as
+# --gemma4-attention-backend ${BACKEND}. Set USE_BACKEND_FLAG=0 to fall back to the
+# eager default and use BACKEND only to label the output file.
 # ============================================================================
 set -eu
 
@@ -36,9 +35,9 @@ export TORCH_COMPILE_DISABLE=1
 export TORCHDYNAMO_DISABLE=1
 export TORCH_INDUCTOR_DISABLE=1
 
-BACKEND=${BACKEND:-eager}                 # eager | ffpa_flash  (labels the trace)
-USE_BACKEND_FLAG=${USE_BACKEND_FLAG:-0}   # 1 once I1/I2 CLI wiring exists (see header)
-BACKEND_FLAG=${BACKEND_FLAG:---gemma4-attention-backend}  # override w/ the real flag name
+BACKEND=${BACKEND:-eager}                 # eager | ffpa_flash  (selects backend + labels trace)
+USE_BACKEND_FLAG=${USE_BACKEND_FLAG:-1}   # 1 = pass --gemma4-attention-backend ${BACKEND}
+BACKEND_FLAG=${BACKEND_FLAG:---gemma4-attention-backend}  # CLI flag name (see pretrain_gemma4.py)
 
 ROOT=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/ataghibakhsh/Gemma4_mlm
 MLM=${MLM_SRC:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}   # THIS worktree root
@@ -155,7 +154,7 @@ options=" \
     --data-cache-path ${RUN_DIR}/data_cache \
     "
 
-# ---- opt-in gemma4 backend flag (see I1/I2 dependency note in the header) ---------
+# ---- gemma4 backend flag (see backend selection note in the header) ---------
 if [ "${USE_BACKEND_FLAG}" = "1" ]; then
   options="${options} ${BACKEND_FLAG} ${BACKEND}"
   if [ "${BACKEND}" = "ffpa_flash" ]; then

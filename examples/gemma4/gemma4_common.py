@@ -75,22 +75,22 @@ def _ensure_ffpa_on_path(install=FFPA_INSTALL):
 
 
 def _apply_attention_backend(config, backend):
-    """Set ``config.attention_backend`` on a Gemma4TransformerConfig.
+    """Set ``config.gemma4_attention_backend`` on a Gemma4TransformerConfig.
 
-    ``attention_backend`` is the opt-in two-backend flag added by I1/I2 (default
-    ``"eager"``). This harness only SETS it; the dispatch lives in megatron/core.
-    If the field is absent (I1/I2 not yet merged into this tree) the instance
-    attribute is still set and ``field_present=False`` is returned so callers can
-    warn that the ffpa_flash path awaits the merge. ``backend`` None or ``"eager"``
-    is a behavioural no-op (eager is the default).
+    ``gemma4_attention_backend`` is the opt-in two-backend flag (default ``"eager"``).
+    This harness only SETS it; the dispatch lives in megatron/core. If the field is
+    absent (the dispatch not yet merged into this tree) the instance attribute is
+    still set and ``field_present=False`` is returned so callers can warn that the
+    ffpa_flash path awaits the merge. ``backend`` None or ``"eager"`` is a
+    behavioural no-op (eager is the default).
     """
-    field_present = hasattr(config, "attention_backend")
+    field_present = hasattr(config, "gemma4_attention_backend")
     if backend is not None:
         # Gemma4TransformerConfig is a non-frozen dataclass -> plain setattr. When
         # the field exists, get_config_for_layer's re-attach loop propagates it
         # per-layer automatically (gemma4_config.py); when it does not, this is an
-        # inert instance attribute until I1/I2 land.
-        setattr(config, "attention_backend", backend)
+        # inert instance attribute until the dispatch lands.
+        setattr(config, "gemma4_attention_backend", backend)
     return config, field_present
 
 
@@ -111,12 +111,12 @@ def _init_distributed():
     model_parallel_cuda_manual_seed(123)
 
 
-def _make_config(num_layers=42, hidden=2560, ffn=10240, attention_backend=None):
+def _make_config(num_layers=42, hidden=2560, ffn=10240, gemma4_attention_backend=None):
     """Real Gemma 4 E4B Megatron config (local-spec bitwise target).
 
-    ``attention_backend`` (``"eager"`` | ``"ffpa_flash"`` | None) selects the
-    opt-in two-backend attention path (I1/I2). None/``"eager"`` = default eager
-    behaviour. See ``_apply_attention_backend``.
+    ``gemma4_attention_backend`` (``"eager"`` | ``"ffpa_flash"`` | None) selects the
+    opt-in two-backend attention path. None/``"eager"`` = default eager behaviour.
+    See ``_apply_attention_backend``.
     """
     from megatron.core.transformer.gemma4_config import Gemma4TransformerConfig
 
@@ -138,7 +138,7 @@ def _make_config(num_layers=42, hidden=2560, ffn=10240, attention_backend=None):
         masked_softmax_fusion=False,
         pipeline_dtype=torch.bfloat16,
     )
-    config, _ = _apply_attention_backend(config, attention_backend)
+    config, _ = _apply_attention_backend(config, gemma4_attention_backend)
     return config
 
 

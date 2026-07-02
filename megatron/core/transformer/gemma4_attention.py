@@ -162,7 +162,7 @@ class Gemma4SelfAttention(SelfAttention):
     ) -> Tensor:
         """Route the (already QKV/norm/RoPE/v-norm-processed) q/k/v to a backend.
 
-        Backends are selected by ``self.config.attention_backend``:
+        Backends are selected by ``self.config.gemma4_attention_backend``:
 
         * ``"eager"`` (default): byte-identical to the historical behavior via
           :meth:`_gemma4_core_attention`. Refuses packed input (R3) unless the
@@ -179,7 +179,7 @@ class Gemma4SelfAttention(SelfAttention):
         key/value ``[s, b, ng, hd]``. Returns context ``[s, b, np, hd]`` so the
         caller's reshape + o_proj is unchanged.
         """
-        backend = self.config.attention_backend
+        backend = self.config.gemma4_attention_backend
 
         if backend == "eager":
             if packed_seq_params is not None and not allow_eager_packed:
@@ -189,15 +189,15 @@ class Gemma4SelfAttention(SelfAttention):
                 raise AssertionError(
                     "Gemma4 eager attention backend does not support packed sequences "
                     "(packed_seq_params was provided): the additive-mask path leaks "
-                    "across documents. Use attention_backend='ffpa_flash' for packed "
-                    "SFT, or set the keyword-only allow_eager_packed=True (negative "
-                    "control only)."
+                    "across documents. Use gemma4_attention_backend='ffpa_flash' for "
+                    "packed SFT, or set the keyword-only allow_eager_packed=True "
+                    "(negative control only)."
                 )
             return self._gemma4_core_attention(query, key, value, attention_mask)
 
         if backend != "ffpa_flash":
             raise ValueError(
-                f"Unknown Gemma4 attention_backend {backend!r}; "
+                f"Unknown Gemma4 gemma4_attention_backend {backend!r}; "
                 "expected 'eager' or 'ffpa_flash'."
             )
 
@@ -213,7 +213,7 @@ class Gemma4SelfAttention(SelfAttention):
             from flash_attn import flash_attn_func, flash_attn_varlen_func
         except ImportError as e:
             raise ImportError(
-                "attention_backend='ffpa_flash' requires the 'ffpa_attn' and "
+                "gemma4_attention_backend='ffpa_flash' requires the 'ffpa_attn' and "
                 "'flash_attn' packages. Ensure PYTHONPATH includes the ffpa_install "
                 f"tree ({_FFPA_INSTALL}) and that flash_attn is installed in the "
                 f"container. Original error: {e}"

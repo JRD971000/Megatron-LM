@@ -20,8 +20,8 @@ Modes:
 
 Import gemma4_common FIRST (nvrx shim + sys.path for THIS worktree's megatron).
 The dispatch + packed plumbing live in megatron/core (tasks I1/I2). This harness
-only SETS config.attention_backend. Where a mode needs the not-yet-merged dispatch,
-it raises a clear "AWAITS I1/I2" message instead of silently mis-testing.
+only SETS config.gemma4_attention_backend. Where a mode needs the not-yet-merged
+dispatch, it raises a clear "AWAITS I1/I2" message instead of silently mis-testing.
 
 Run with the container python (nemo.26.06), e.g.:
     python3 examples/gemma4/parity_backend.py --mode v1 --backend ffpa_flash
@@ -171,8 +171,8 @@ def _load_model(backend, ckpt=MLM_CKPT):
     """Build a bf16/cuda Gemma4Model on the given backend + load the converted ckpt.
 
     Returns (model, field_present). ``field_present`` is False when this tree does
-    not yet carry config.attention_backend (I1/I2 unmerged) -> ffpa_flash will run
-    the eager path until the merge, which the caller reports.
+    not yet carry config.gemma4_attention_backend (I1/I2 unmerged) -> ffpa_flash will
+    run the eager path until the merge, which the caller reports.
     """
     from megatron.core import dist_checkpointing
     from megatron.core.models.gemma4.gemma4_layer_specs import get_gemma4_layer_local_spec
@@ -205,7 +205,7 @@ def _load_model(backend, ckpt=MLM_CKPT):
 def _report_backend(backend, field_present):
     if backend == "ffpa_flash" and not field_present:
         print(
-            "\n[AWAITS I1/I2] config.attention_backend is NOT a field in this tree yet.\n"
+            "\n[AWAITS I1/I2] config.gemma4_attention_backend is NOT a field in this tree yet.\n"
             "  The ffpa_flash dispatch is not merged, so this run exercises the EAGER path.\n"
             "  Plumbing (backend flag set, ckpt load, tokenization, comparison) is validated;\n"
             "  full ffpa_flash parity is gated on the I1+I2 merge (STAGE 5).\n",

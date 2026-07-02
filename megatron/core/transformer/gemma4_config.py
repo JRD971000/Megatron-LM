@@ -44,17 +44,18 @@ class Gemma4TransformerConfig(TransformerConfig):
     # Attention backend selector (gemma4-only). "eager" = the current bitwise eager
     # path -> ZERO behavior change / rollback default. "ffpa_flash" = the opt-in
     # two-backend kernel path (FFPA full + Flash sliding) wired up by I1's dispatch,
-    # which reads ``self.config.attention_backend``.
+    # which reads ``self.config.gemma4_attention_backend``.
     #
-    # NOTE (verified): this field SHADOWS the base ``TransformerConfig.attention_backend``
-    # (an ``AttnBackend`` enum, default ``AttnBackend.auto``). Because the name IS a base
-    # TransformerConfig field, ``get_config_for_layer`` propagates it per-layer through the
-    # dict round-trip (L89-93) -- NOT the gemma4-only re-attach loop (L102-104), which only
-    # covers names absent from the base config. The per-layer base ``TransformerConfig``
-    # therefore still carries ``attention_backend="eager"``. A str value simply falls
-    # through every ``AttnBackend`` branch in ``LanguageModule._set_attention_backend`` (so
-    # no NVTE_* env var is set), which is harmless: gemma4 uses its own attention, not TE.
-    attention_backend: str = "eager"
+    # NOTE: this is a DISTINCT name from the base ``TransformerConfig.attention_backend``
+    # (an ``AttnBackend`` enum, default ``AttnBackend.auto``) ON PURPOSE. An earlier draft
+    # named it ``attention_backend`` and thereby SHADOWED the base field, so the training
+    # entrypoint's ``core_transformer_config_from_args`` clobbered our str "eager" with the
+    # base ``--attention-backend`` enum -> ``_attn_dispatch`` then saw an enum and raised.
+    # With the distinct name, ``core_transformer_config_from_args`` never touches it, and
+    # because it is NOT a base ``TransformerConfig`` field, ``get_config_for_layer``
+    # propagates it per-layer via the gemma4-only re-attach loop (see below), NOT the base
+    # dict round-trip. The per-layer configs therefore carry ``gemma4_attention_backend``.
+    gemma4_attention_backend: str = "eager"
 
     def __post_init__(self):
         # Sliding layers are the common case -> make them the base defaults.

@@ -48,7 +48,7 @@ def _mk_attn(layer_type, backend="ffpa_flash"):
     read by _attn_dispatch / _gemma4_core_attention."""
     attn = Gemma4SelfAttention.__new__(Gemma4SelfAttention)
     attn.config = types.SimpleNamespace(
-        attention_backend=backend, softmax_scale=1.0, sliding_window=512
+        gemma4_attention_backend=backend, softmax_scale=1.0, sliding_window=512
     )
     attn.layer_type = layer_type
     return attn

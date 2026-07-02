@@ -83,6 +83,22 @@ from model_provider import model_provider
 from pretrain_gpt import forward_step, get_embedding_ranks, train_valid_test_datasets_provider
 
 
+def add_gemma4_args(parser):
+    """Add Gemma4-specific CLI args (mirrors ``add_modelopt_args``)."""
+    group = parser.add_argument_group(title="gemma4")
+    group.add_argument(
+        "--gemma4-attention-backend",
+        type=str,
+        default="eager",
+        choices=["eager", "ffpa_flash"],
+        help="Gemma4-only attention backend selector. 'eager' (default) is the bitwise "
+        "eager path; 'ffpa_flash' is the opt-in two-backend kernel path (FFPA full + "
+        "Flash sliding). Distinct from the base --attention-backend (TE's AttnBackend "
+        "enum), which Gemma4 does not use.",
+    )
+    return parser
+
+
 def gemma4_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
     """Build a :class:`Gemma4Model` (mirrors ``gpt_builder`` for the GPT model)."""
     print_rank_0('building Gemma4 model ...')
@@ -90,6 +106,10 @@ def gemma4_builder(args, pre_process, post_process, vp_stage=None, config=None, 
         # Build the Gemma4 subclass so its heterogeneous per-layer specs, softcap,
         # sqrt(H) embedding scaling, and PLE dims are populated from the defaults.
         config = core_transformer_config_from_args(args, config_class=Gemma4TransformerConfig)
+        # core_transformer_config_from_args does NOT set gemma4-only fields; wire the
+        # attention backend from the CLI arg here (default "eager"). This is a str, not
+        # the base AttnBackend enum -> get_config_for_layer propagates it per-layer.
+        config.gemma4_attention_backend = getattr(args, "gemma4_attention_backend", "eager")
 
     # Gemma4 MLP is a GeGLU with tanh-approx GELU. There is no CLI flag for this exact
     # combination (--swiglu is SiLU, --quick-geglu is quick_gelu), so set it here to
@@ -156,10 +176,16 @@ if __name__ == "__main__":
     # Temporary for transition to core datasets.
     setattr(train_valid_test_datasets_provider, "is_distributed", True)
 
-    args = parse_and_validate_args(args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
+    args = parse_and_validate_args(
+        extra_args_provider=add_gemma4_args,
+        args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
+    )
     # Use the Gemma4 transformer config in the pretrain config container too so the
     # container is consistent with the model the builder constructs.
     transformer_cfg = core_transformer_config_from_args(args, config_class=Gemma4TransformerConfig)
+    # Keep the container config consistent with the builder: set the gemma4-only
+    # attention backend from the CLI arg (core_transformer_config_from_args does not).
+    transformer_cfg.gemma4_attention_backend = getattr(args, "gemma4_attention_backend", "eager")
     model_cfg = gpt_config_from_args(args, config=transformer_cfg)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
     pretrain(
