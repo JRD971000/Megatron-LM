@@ -334,14 +334,23 @@ def run_v2(args):
     packed_ids, cu, max_seqlen, pos, spans = _build_pack(tok, texts)
     print(f"  packed {len(texts)} docs, cu_seqlens={cu.tolist()}, T={packed_ids.shape[1]}")
 
-    # Standalone per-doc logits under the TEST backend (unpacked oracle for R4).
+    # Standalone per-doc logits under the TEST backend, run through the SAME varlen
+    # kernel as the pack (each doc as its own single-segment pack). This isolates
+    # cross-document LEAKAGE from varlen-vs-dense kernel precision: on this peaked
+    # model (max_softmax_prob~1.0) a dense-vs-varlen rounding difference alone is ~5%
+    # rel, which would swamp the leak signal. Multi-doc-pack doc-i vs single-doc-pack
+    # doc-i uses the identical kernel/precision, so any residual diff is pure leakage.
     test_model, field_present = _load_model(args.backend)
     _report_backend(args.backend, field_present)
     standalone = []
     with torch.no_grad():
         for t in texts:
-            ids = _chat_ids(tok, t)
-            standalone.append(test_model(ids.cuda()).float().cpu())
+            ids1 = _chat_ids(tok, t)  # [1, n]
+            n1 = ids1.shape[1]
+            cu1 = torch.tensor([0, n1], dtype=torch.int32, device="cuda")
+            pos1 = torch.arange(n1, dtype=torch.long).unsqueeze(0)
+            psp1 = _packed_seq_params(cu1, n1)
+            standalone.append(_forward_packed(test_model, ids1, pos1, psp1))
 
     # Packed forward under the TEST backend.
     try:
@@ -365,27 +374,29 @@ def run_v2(args):
     print(f"\nV2 (packed no-leak) verdict: {'PASS' if ok else 'FAIL'} "
           f"(per-doc PER-TOKEN max-abs<={TOL_LOGIT_MAXABS} OR rel<={TOL_LOGIT_REL}; greedy exact)")
 
-    # ------ negative control: eager + packed MUST leak (R3 escape kwarg) ------ #
-    print("\n----- V2 negative control: eager + packed leaks (allow_eager_packed) -----")
+    # ------ negative control: the EAGER backend leaks across documents --------- #
+    # The eager additive-mask path ignores cu_seqlens: on a concatenated pack it uses
+    # a full causal mask over T, so doc-i (i>=1) attends to earlier documents. We show
+    # this WITHIN the eager backend (no backend confound): doc-i run inside the pack vs
+    # doc-i run ALONE. No packed_seq_params is passed (so R3 does not fire and eager
+    # runs its normal full-mask path — exactly the naive-packing failure mode). Reset
+    # positions are supplied so RoPE is per-doc-correct and ONLY the attention leak shows.
+    print("\n----- V2 negative control: eager (full-mask) leaks across documents -----")
     eager_model, _ = _load_model("eager")
-    try:
-        with torch.no_grad():
-            psp = _packed_seq_params(cu, max_seqlen)
-            eager_packed = _forward_packed(
-                eager_model, packed_ids, pos, psp, allow_eager_packed=True
-            )
-        leaks = []
-        for (s, e), sa in zip(spans, standalone):
-            d = (sa - eager_packed[:, s:e, :]).abs().max().item()
-            g = torch.equal(sa.argmax(-1), eager_packed[:, s:e, :].argmax(-1))
-            leaks.append((d, g))
-            print(f"  eager doc[{s}:{e}] max-abs={d:.4e} greedy={'MATCH' if g else 'DIFFER'}")
-        # Expect leakage on docs 2+ (they see doc-1 tokens without a varlen mask).
-        leaked = any((not g) or (d > TOL_LOGIT_MAXABS) for d, g in leaks[1:])
-        print(f"  eager-leak demonstrated: {leaked} (docs 2+ diverge from standalone)")
-    except (TypeError, AssertionError) as e:
-        print(f"\n[AWAITS I1/I2] eager+packed control needs the R3 assert/escape + I2 plumbing "
-              f"({e}). Negative control is gated on the merge.", flush=True)
+    with torch.no_grad():
+        eager_alone = []
+        for t in texts:
+            ids1 = _chat_ids(tok, t)
+            eager_alone.append(eager_model(ids1.cuda()).float().cpu())
+        eager_packed = eager_model(packed_ids.cuda(), position_ids=pos.cuda()).float().cpu()
+    leaks = []
+    for (s, e), ea in zip(spans, eager_alone):
+        d = (ea - eager_packed[:, s:e, :]).abs().max().item()
+        g = torch.equal(ea.argmax(-1), eager_packed[:, s:e, :].argmax(-1))
+        leaks.append((d, g))
+        print(f"  eager doc[{s}:{e}] alone-vs-in-pack max-abs={d:.4e} greedy={'MATCH' if g else 'DIFFER'}")
+    leaked = any((not g) or (d > 1.0) for d, g in leaks[1:])  # docs 2+ should diverge hugely
+    print(f"  eager-leak demonstrated: {leaked} (docs 2+ diverge from their standalone run)")
     del eager_model
     torch.cuda.empty_cache()
     return ok
