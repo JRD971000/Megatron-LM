@@ -12,6 +12,14 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 
+# Pure-python FFPA wheel install tree (installed --no-deps to avoid a torch shadow;
+# see V_RESULTS V0 notes). The RUN env sets PYTHONPATH to this; _attn_dispatch also
+# inserts it defensively before importing ffpa_attn.
+_FFPA_INSTALL = (
+    "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/ataghibakhsh"
+    "/Gemma4_mlm/ffpa_install"
+)
+
 
 @dataclass
 class Gemma4SelfAttentionSubmodules(SelfAttentionSubmodules):
@@ -99,6 +107,8 @@ class Gemma4SelfAttention(SelfAttention):
         *,
         rotary_cos_sin: Optional[tuple] = None,
         kv_bus: Optional[dict] = None,
+        packed_seq_params: Optional[object] = None,
+        allow_eager_packed: bool = False,
         **kwargs,
     ) -> tuple[Tensor, Optional[Tensor]]:
         """Clean eager forward. ``hidden_states`` is [s, b, h] (MLM seq-first).
@@ -132,12 +142,167 @@ class Gemma4SelfAttention(SelfAttention):
             if self.store_full_length_kv:
                 kv_bus[self.layer_type] = (key, value)
 
-        context = self._gemma4_core_attention(query, key, value, attention_mask)
+        context = self._attn_dispatch(
+            query, key, value, attention_mask, packed_seq_params, allow_eager_packed
+        )
 
         # [s, b, np, hd] -> [s, b, np*hd] -> o_proj.
         context = context.reshape(context.size(0), context.size(1), -1)
         output, bias = apply_module(self.linear_proj)(context)
         return output, bias
+
+    def _attn_dispatch(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Optional[Tensor],
+        packed_seq_params: Optional[object],
+        allow_eager_packed: bool,
+    ) -> Tensor:
+        """Route the (already QKV/norm/RoPE/v-norm-processed) q/k/v to a backend.
+
+        Backends are selected by ``self.config.attention_backend``:
+
+        * ``"eager"`` (default): byte-identical to the historical behavior via
+          :meth:`_gemma4_core_attention`. Refuses packed input (R3) unless the
+          keyword-only ``allow_eager_packed`` negative-control escape is set,
+          because the eager additive-mask path cannot express leak-free packing.
+        * ``"ffpa_flash"``: FFPA for full (head_dim=512) layers, FlashAttention
+          for sliding (head_dim=256) layers, honoring ``cu_seqlens`` for packing.
+          ``softmax_scale`` is passed EXPLICITLY (== 1.0; flash otherwise defaults
+          to 1/sqrt(d) -- R2). GQA is handled natively by the kernels
+          (``enable_gqa=True`` for FFPA, native for flash); K/V keep ``ng`` heads,
+          NO manual repeat.
+
+        q/k/v come in Megatron seq-first layout: query ``[s, b, np, hd]``,
+        key/value ``[s, b, ng, hd]``. Returns context ``[s, b, np, hd]`` so the
+        caller's reshape + o_proj is unchanged.
+        """
+        backend = self.config.attention_backend
+
+        if backend == "eager":
+            if packed_seq_params is not None and not allow_eager_packed:
+                # R3: the eager additive-mask path attends across the full [s, s]
+                # grid and cannot block cross-document leakage. Mirror
+                # dot_product_attention.py's packed-seq refusal.
+                raise AssertionError(
+                    "Gemma4 eager attention backend does not support packed sequences "
+                    "(packed_seq_params was provided): the additive-mask path leaks "
+                    "across documents. Use attention_backend='ffpa_flash' for packed "
+                    "SFT, or set the keyword-only allow_eager_packed=True (negative "
+                    "control only)."
+                )
+            return self._gemma4_core_attention(query, key, value, attention_mask)
+
+        if backend != "ffpa_flash":
+            raise ValueError(
+                f"Unknown Gemma4 attention_backend {backend!r}; "
+                "expected 'eager' or 'ffpa_flash'."
+            )
+
+        # ---- ffpa_flash: lazy, guarded imports -------------------------------
+        try:
+            import sys
+
+            if _FFPA_INSTALL not in sys.path:
+                # Defensive: the RUN env sets PYTHONPATH, but insert anyway so the
+                # pure-python ffpa wheel is importable without relying on it.
+                sys.path.insert(0, _FFPA_INSTALL)
+            import ffpa_attn
+            from flash_attn import flash_attn_func, flash_attn_varlen_func
+        except ImportError as e:
+            raise ImportError(
+                "attention_backend='ffpa_flash' requires the 'ffpa_attn' and "
+                "'flash_attn' packages. Ensure PYTHONPATH includes the ffpa_install "
+                f"tree ({_FFPA_INSTALL}) and that flash_attn is installed in the "
+                f"container. Original error: {e}"
+            ) from e
+
+        scale = self.config.softmax_scale  # == 1.0, passed EXPLICITLY (R2).
+        s_q, b, np_, hd = query.shape
+
+        packed = packed_seq_params is not None
+
+        if self.layer_type == "full":
+            if packed:
+                # b MUST be 1 for THD/varlen packing.
+                assert b == 1, f"varlen (packed) path requires b==1, got b={b}"
+                cu_q = packed_seq_params.cu_seqlens_q
+                max_q = packed_seq_params.max_seqlen_q
+                max_kv = packed_seq_params.max_seqlen_kv
+                # [s, 1, n, hd] -> [T, n, hd] = [T, H, D].
+                q = query.squeeze(1).contiguous()
+                k = key.squeeze(1).contiguous()
+                v = value.squeeze(1).contiguous()
+                assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
+                out = ffpa_attn.ffpa_attn_varlen_func(
+                    q,
+                    k,
+                    v,
+                    cu_q,
+                    cu_q,  # self-attention: same cu_seqlens for q and kv.
+                    max_q,
+                    max_kv,
+                    softmax_scale=scale,
+                    causal=True,
+                    enable_gqa=True,
+                )
+                out = out[0] if isinstance(out, tuple) else out
+                # [T, n, hd] -> [s, 1, n, hd] = [s, b, np, hd].
+                return out.reshape(s_q, b, np_, hd)
+            # dense: [s, b, n, hd] -> [b, n, s, hd] = [B, H, S, D].
+            q = query.permute(1, 2, 0, 3).contiguous()
+            k = key.permute(1, 2, 0, 3).contiguous()
+            v = value.permute(1, 2, 0, 3).contiguous()
+            assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
+            out = ffpa_attn.ffpa_attn_func(
+                q, k, v, is_causal=True, scale=scale, enable_gqa=True
+            )
+            out = out[0] if isinstance(out, tuple) else out
+            # [B, H, S, D] -> [s, b, np, hd].
+            return out.permute(2, 0, 1, 3).contiguous()
+
+        if self.layer_type == "sliding":
+            window = self.config.sliding_window  # 512; flash left window = window - 1.
+            if packed:
+                assert b == 1, f"varlen (packed) path requires b==1, got b={b}"
+                cu_q = packed_seq_params.cu_seqlens_q
+                max_q = packed_seq_params.max_seqlen_q
+                max_kv = packed_seq_params.max_seqlen_kv
+                # [s, 1, n, hd] -> [T, n, hd] = [T, H, D].
+                q = query.squeeze(1).contiguous()
+                k = key.squeeze(1).contiguous()
+                v = value.squeeze(1).contiguous()
+                assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
+                out = flash_attn_varlen_func(
+                    q,
+                    k,
+                    v,
+                    cu_q,
+                    cu_q,
+                    max_q,
+                    max_kv,
+                    softmax_scale=scale,
+                    causal=True,
+                    window_size=(window - 1, 0),
+                )
+                out = out[0] if isinstance(out, tuple) else out
+                # [T, n, hd] -> [s, 1, n, hd].
+                return out.reshape(s_q, b, np_, hd)
+            # dense: [s, b, n, hd] -> [b, s, n, hd] = [B, S, H, D].
+            q = query.permute(1, 0, 2, 3).contiguous()
+            k = key.permute(1, 0, 2, 3).contiguous()
+            v = value.permute(1, 0, 2, 3).contiguous()
+            assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
+            out = flash_attn_func(
+                q, k, v, causal=True, softmax_scale=scale, window_size=(window - 1, 0)
+            )
+            out = out[0] if isinstance(out, tuple) else out
+            # [B, S, H, D] -> [s, b, np, hd] (permute(1,0,2,3) is self-inverse here).
+            return out.permute(1, 0, 2, 3).contiguous()
+
+        raise ValueError(f"Unknown Gemma4 layer_type {self.layer_type!r}.")
 
     def _gemma4_core_attention(
         self, query: Tensor, key: Tensor, value: Tensor, attention_mask: Optional[Tensor]
