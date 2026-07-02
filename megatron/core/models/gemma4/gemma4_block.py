@@ -29,6 +29,7 @@ class Gemma4TransformerBlock(TransformerBlock):
         per_layer_inputs: Tensor = None,
         rotary_cos_sin_by_type: dict = None,
         attention_mask_by_type: dict = None,
+        packed_seq_params=None,
         **kwargs,
     ):
         """Run the gemma4 decoder layers. ``hidden_states`` is [s, b, h]."""
@@ -47,6 +48,7 @@ class Gemma4TransformerBlock(TransformerBlock):
                 per_layer_input=per_layer_inputs[:, :, i, :],
                 rotary_cos_sin=rotary_cos_sin_by_type[layer_type],
                 kv_bus=kv_bus,
+                packed_seq_params=packed_seq_params,
             )
 
         if self.final_layernorm is not None:

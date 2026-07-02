@@ -105,6 +105,7 @@ class Gemma4TransformerLayer(TransformerLayer):
         per_layer_input: Optional[Tensor] = None,
         rotary_cos_sin: Optional[tuple] = None,
         kv_bus: Optional[dict] = None,
+        packed_seq_params=None,
         **kwargs,
     ):
         """Decoder-layer forward. ``hidden_states`` is [s, b, h] (MLM seq-first).
@@ -125,6 +126,7 @@ class Gemma4TransformerLayer(TransformerLayer):
             attention_mask=attention_mask,
             rotary_cos_sin=rotary_cos_sin,
             kv_bus=kv_bus,
+            packed_seq_params=packed_seq_params,
         )
         attn_output = apply_module(self.post_self_attn_layernorm)(attn_output)
         hidden_states = residual + attn_output

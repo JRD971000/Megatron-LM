@@ -41,6 +41,21 @@ class Gemma4TransformerConfig(TransformerConfig):
     hidden_size_per_layer_input: int = 256
     vocab_size_per_layer_input: int = 262144
 
+    # Attention backend selector (gemma4-only). "eager" = the current bitwise eager
+    # path -> ZERO behavior change / rollback default. "ffpa_flash" = the opt-in
+    # two-backend kernel path (FFPA full + Flash sliding) wired up by I1's dispatch,
+    # which reads ``self.config.attention_backend``.
+    #
+    # NOTE (verified): this field SHADOWS the base ``TransformerConfig.attention_backend``
+    # (an ``AttnBackend`` enum, default ``AttnBackend.auto``). Because the name IS a base
+    # TransformerConfig field, ``get_config_for_layer`` propagates it per-layer through the
+    # dict round-trip (L89-93) -- NOT the gemma4-only re-attach loop (L102-104), which only
+    # covers names absent from the base config. The per-layer base ``TransformerConfig``
+    # therefore still carries ``attention_backend="eager"``. A str value simply falls
+    # through every ``AttnBackend`` branch in ``LanguageModule._set_attention_backend`` (so
+    # no NVTE_* env var is set), which is harmless: gemma4 uses its own attention, not TE.
+    attention_backend: str = "eager"
+
     def __post_init__(self):
         # Sliding layers are the common case -> make them the base defaults.
         self.kv_channels = self.sliding_kv_channels

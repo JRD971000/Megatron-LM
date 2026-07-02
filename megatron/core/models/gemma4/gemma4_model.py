@@ -19,6 +19,51 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 
 
+def _reset_position_ids_from_cu_seqlens(cu_seqlens: Tensor) -> Tensor:
+    """R1: build per-document *reset* RoPE positions from cu_seqlens.
+
+    Under SFT packing a single ``[1, s]`` sequence concatenates several documents
+    end-to-end. Gemma4 RoPE reads ``position_ids`` directly (gemma4_rope.py:107), so a
+    flat ``arange(s)`` gives documents 2+ the WRONG positions even though the varlen
+    kernel blocks cross-document attention (the kernel fixes attention leakage, not RoPE).
+
+    Given the cumulative ``cu_seqlens = [0, l0, l0+l1, ...]`` this returns the
+    concatenation of ``arange(len)`` per segment, e.g. ``[0, 3, 7] -> [0, 1, 2, 0, 1, 2, 3]``.
+    Vectorized (no per-segment python / host sync) via a segment-id gather.
+    """
+    cu = cu_seqlens.reshape(-1).to(torch.long)
+    seg_lens = (cu[1:] - cu[:-1]).clamp(min=0)
+    # Which segment each packed token belongs to, e.g. lens [3, 4] -> [0,0,0,1,1,1,1].
+    seg_ids = torch.repeat_interleave(
+        torch.arange(seg_lens.numel(), device=cu.device), seg_lens
+    )
+    seg_starts = cu[:-1][seg_ids]
+    return torch.arange(seg_ids.numel(), device=cu.device) - seg_starts
+
+
+def _assert_position_ids_reset(position_ids: Tensor, cu_seqlens: Tensor) -> None:
+    """R1: assert a caller-supplied ``position_ids`` resets per document.
+
+    Single source of truth for packed positions is the dataloader (training) or the
+    model (parity scripts). When the caller already passed ``position_ids`` we must NOT
+    overwrite it, but we must guard against a flat ``arange`` silently corrupting RoPE.
+    Cheap check: the first token of every packed segment must have position 0. A flat
+    arange makes segment ``i`` start at ``cu_seqlens[i] != 0`` -> raise, which forces
+    training to use ``reset_position_ids=True`` (the SFT dataloader builds per-conversation
+    ``range(len)``; see megatron/training/datasets/sft_dataset.py).
+    """
+    cu = cu_seqlens.reshape(-1).to(torch.long)
+    seg_starts = cu[:-1]
+    starts_pos = position_ids.reshape(-1)[seg_starts]
+    if not bool(torch.all(starts_pos == 0)):
+        raise AssertionError(
+            "Gemma4 packed forward (R1): supplied position_ids do not reset to 0 at the "
+            "cu_seqlens document boundaries (they look like a flat arange). Per-document "
+            "RoPE would be wrong. Set reset_position_ids=True so positions reset per "
+            "document (the SFT dataloader already builds per-conversation range(len))."
+        )
+
+
 class Gemma4Model(GPTModel):
     """Gemma 4 E4B model (HF ``Gemma4ForCausalLM``, modeling_gemma4.py:1646-1905).
 
@@ -92,8 +137,31 @@ class Gemma4Model(GPTModel):
         b, s = input_ids.shape
         device = input_ids.device
 
+        packed_seq_params = kwargs.get("packed_seq_params")
+
+        position_ids_provided = position_ids is not None
         if position_ids is None:
             position_ids = torch.arange(s, device=device).unsqueeze(0).expand(b, -1)
+
+        # R1 (CRITICAL): under packing, RoPE positions MUST reset per document, otherwise
+        # documents 2+ get the wrong RoPE (the varlen kernel blocks cross-doc attention but
+        # does NOT fix positions). See TASK-001 R1. This runs BEFORE self.embedding (which
+        # consumes position_ids) and is a no-op when unpacked.
+        # Source of truth: the dataloader in training (position_ids provided), the model in
+        # parity scripts (position_ids None). cu_seqlens_q may be the PADDED variant -- it is
+        # the only one PackedSeqParams exposes (pretrain_gpt.py forces cu_seqlens==padded);
+        # V2/V4 use NO intra-pack padding so padded==real there and the derivation is exact.
+        if packed_seq_params is not None:
+            cu_seqlens = packed_seq_params.cu_seqlens_q_padded
+            if cu_seqlens is None:
+                cu_seqlens = packed_seq_params.cu_seqlens_q
+            if cu_seqlens is not None:
+                if position_ids_provided:
+                    # Do NOT overwrite the caller's positions; just verify they reset.
+                    _assert_position_ids_reset(position_ids, cu_seqlens)
+                else:
+                    # Parity path: derive reset positions from cu_seqlens (b == 1 packing).
+                    position_ids = _reset_position_ids_from_cu_seqlens(cu_seqlens).unsqueeze(0)
 
         # Embedding [s, b, h] (MLM seq-first) with bf16-rounded sqrt(H) scaling.
         decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
@@ -147,6 +215,7 @@ class Gemma4Model(GPTModel):
             per_layer_inputs=per_layer_inputs,
             rotary_cos_sin_by_type=rotary_cos_sin_by_type,
             attention_mask_by_type=attention_mask_by_type,
+            packed_seq_params=packed_seq_params,
         )
 
         # LM head (tied) -> final logit softcap -> loss/return.
