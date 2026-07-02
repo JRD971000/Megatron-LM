@@ -87,8 +87,11 @@ TRAIN_SAMPLES=$((GBS * NUM_STEPS))
 
 LOSS_LOG=${RUN_DIR}/loss_${BACKEND}.log
 
-# NOTE on packing/eager: SFT always packs (cu_seqlens via PackedSeqParams). --reset-position-ids
-# makes RoPE per-document (R1). We let the dataloader BUILD the attention mask (i.e. we do NOT
+# NOTE on packing/eager: SFT always packs (cu_seqlens via PackedSeqParams). The SFT dataloader
+# BUILDS per-conversation reset position_ids natively (range(len) per conv) and ASSERTS
+# `not reset_position_ids` (sft_dataset.py:134) -- so we must NOT pass --reset-position-ids;
+# those reset positions flow to the model and satisfy R1's per-document RoPE assert directly.
+# We let the dataloader BUILD the attention mask (i.e. we do NOT
 # pass --no-create-attention-mask-in-dataloader) so the eager oracle attends block-diagonally
 # within each doc; ffpa_flash ignores the mask and uses cu_seqlens (leak-free by construction).
 # Whether eager+packed additionally requires I1's allow_eager_packed / R3 escape is an I1/I2
@@ -141,7 +144,6 @@ options=" \
     --tokenizer-model ${HF_WEIGHTS} \
     --data-path ${SUBSET} \
     --split 100,0,0 \
-    --reset-position-ids \
     --distributed-timeout-minutes 20 \
     --disable-gloo-process-groups \
     --num-workers 1 \
