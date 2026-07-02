@@ -107,15 +107,37 @@ def _decoder(bundle):
     return tok if mode == "hf" else _RawDecoder(tok)
 
 
+def _extract_ids_1d(res):
+    """Extract a 1-D python list of token ids from any apply_chat_template return type:
+    torch.Tensor, dict/BatchEncoding (.input_ids), tokenizers.Encoding (.ids), or list."""
+    import numpy as _np
+
+    if isinstance(res, torch.Tensor):
+        arr = res.tolist()
+    elif isinstance(res, dict) or hasattr(res, "input_ids"):
+        v = res["input_ids"]
+        return _extract_ids_1d(v)
+    elif hasattr(res, "ids"):  # tokenizers.Encoding
+        arr = list(res.ids)
+    else:
+        arr = _np.asarray(res).tolist()
+    # squeeze a leading batch dim of 1 if present ([[...]] -> [...])
+    if len(arr) > 0 and isinstance(arr[0], (list, tuple)):
+        arr = arr[0]
+    return [int(x) for x in arr]
+
+
 def _chat_ids(bundle, text):
     """Chat-template tokenize a single user turn -> LongTensor [1, S]."""
     mode, tok = bundle
     if mode == "hf":
         messages = [{"role": "user", "content": text}]
-        ids = tok.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt")
-        if not isinstance(ids, torch.Tensor):
-            ids = ids["input_ids"] if isinstance(ids, dict) else torch.tensor(ids)
-        return ids.long()
+        # nemo.26.06's transformers returns a tokenizers.Encoding (not a tensor) from
+        # apply_chat_template; extract ids robustly across all return types (tensor /
+        # dict|BatchEncoding / tokenizers.Encoding / list), mirroring sft_tokenizer.
+        res = tok.apply_chat_template(messages, add_generation_prompt=True, tokenize=True)
+        seq = _extract_ids_1d(res)
+        return torch.tensor([seq], dtype=torch.long)
     # raw fallback: standard Gemma chat format, ensure leading <bos>=2.
     prompt = f"<start_of_turn>user\n{text}<end_of_turn>\n<start_of_turn>model\n"
     seq = tok.encode(prompt).ids
