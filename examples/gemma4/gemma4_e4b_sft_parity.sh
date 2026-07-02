@@ -91,8 +91,9 @@ LOSS_LOG=${RUN_DIR}/loss_${BACKEND}.log
 # BUILDS per-conversation reset position_ids natively (range(len) per conv) and ASSERTS
 # `not reset_position_ids` (sft_dataset.py:134) -- so we must NOT pass --reset-position-ids;
 # those reset positions flow to the model and satisfy R1's per-document RoPE assert directly.
-# We let the dataloader BUILD the attention mask (i.e. we do NOT
-# pass --no-create-attention-mask-in-dataloader) so the eager oracle attends block-diagonally
+# SFT also asserts create_attention_mask==False (sft_dataset.py:184), so we DO pass
+# --no-create-attention-mask-in-dataloader. Gemma4 builds its own masks anyway: the eager path
+# builds attention_mask_by_type inside Gemma4Model.forward, and the ffpa_flash path uses cu_seqlens
 # within each doc; ffpa_flash ignores the mask and uses cu_seqlens (leak-free by construction).
 # Whether eager+packed additionally requires I1's allow_eager_packed / R3 escape is an I1/I2
 # decision resolved in STAGE 5.
@@ -140,6 +141,7 @@ options=" \
     --no-load-rng \
     --sft \
     --sft-tokenizer-prompt-format gemma \
+    --no-create-attention-mask-in-dataloader \
     --tokenizer-type SFTTokenizer \
     --tokenizer-model ${HF_WEIGHTS} \
     --data-path ${SUBSET} \
