@@ -121,7 +121,11 @@ class MegatronTokenizerText(MegatronTokenizerBase):
         )
 
     def tokenize_conversation(
-        self, conversation: List[Dict], return_target: bool, add_generation_prompt: bool
+        self,
+        conversation: List[Dict],
+        return_target: bool,
+        add_generation_prompt: bool,
+        tools: List[Dict] = None,
     ):
         """Convert a conversation to tokens. Needed for SFTTokenizer.
 
@@ -142,6 +146,7 @@ class MegatronTokenizerText(MegatronTokenizerBase):
                 conversation=conversation,
                 return_target=return_target,
                 add_generation_prompt=add_generation_prompt,
+                tools=tools,
             )
         else:
             raise NotImplementedError("This method is supported only for SFTTokenizer.")
