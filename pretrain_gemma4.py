@@ -36,22 +36,21 @@ def _apply_nvrx_version_shim():
     try:
         import nvidia_resiliency_ext as _nvrx
 
-        if not hasattr(_nvrx, "__version__"):
-            v = None
-            try:
-                from importlib.metadata import version
+        # Fire when __version__ is missing OR a dev pre-release below 0.6.0 (e.g.
+        # "0.6.0.dev69+..."), which PEP 440 orders BELOW the final "0.6.0" and so
+        # fails the >=0.6.0 guard in dist_checkpointing/strategies/nvrx.py. We never
+        # use async checkpointing here, so a satisfying value is safe. Mirrors the
+        # robust shim in examples/gemma4/gemma4_common.py.
+        need = True
+        try:
+            from packaging.version import Version as _V
 
-                v = version("nvidia_resiliency_ext")
-            except Exception:
-                v = None
-            try:
-                from packaging.version import Version as _V
-
-                if v is None or _V(v) < _V("0.6.0"):
-                    v = "0.6.0"
-            except Exception:
-                v = v or "0.6.0"
-            _nvrx.__version__ = v
+            cur = getattr(_nvrx, "__version__", None)
+            need = cur is None or _V(str(cur)) < _V("0.6.0")
+        except Exception:
+            need = not hasattr(_nvrx, "__version__")
+        if need:
+            _nvrx.__version__ = "0.6.0"
     except Exception:
         # nvrx absent entirely -> MLM's HAVE_NVRX=False path handles it fine.
         pass
