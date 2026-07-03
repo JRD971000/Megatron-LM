@@ -15,6 +15,29 @@ from megatron.core.datasets.utils import Split
 IGNORE_INDEX = -100
 
 
+def _strip_none(obj):
+    """Recursively drop dict keys whose value is None.
+
+    ``datasets.load_dataset("json", ...)`` builds a single Arrow schema for the whole
+    file, so nested structs are UNIFIED across every row AND across every element of a
+    list. For tool-calling data this means each entry of ``tools`` receives the UNION of
+    all tools' ``parameters.properties`` keys, with the ones that don't belong to that
+    tool filled as ``None`` (e.g. a 2-property tool becomes 78 properties, 76 of them
+    null). The chat template renders that null-filled union, bloating the prompt ~6x and
+    pushing the assistant (supervised) tokens past ``seq_length`` -- they then get
+    right-truncated away, leaving an all-``IGNORE_INDEX`` target (zero loss, zero grad).
+
+    For the chat template an absent key and a ``None`` key are equivalent (it uses
+    ``.get(...)``), and tool-schema properties / message fields are never legitimately
+    ``None``, so pruning null values restores the exact per-record structure.
+    """
+    if isinstance(obj, dict):
+        return {k: _strip_none(v) for k, v in obj.items() if v is not None}
+    if isinstance(obj, list):
+        return [_strip_none(v) for v in obj]
+    return obj
+
+
 class SFTLowLevelDataset:
     """The low-level dataset loading jsonl data for SFT
 
@@ -46,12 +69,14 @@ class SFTLowLevelDataset:
         return len(self.dataset)
 
     def __getitem__(self, idx: int) -> list:
-        return self.dataset[idx]["messages"]
+        # Strip datasets-injected null keys (Arrow schema unification) so the chat
+        # template renders the original per-record structure -- see _strip_none.
+        return _strip_none(self.dataset[idx]["messages"])
 
     def get_tools(self, idx: int) -> Optional[list]:
         """Return the optional per-record tool definitions (or None)."""
         row = self.dataset[idx]
-        return row.get("tools")
+        return _strip_none(row.get("tools"))
 
 
 class SFTDataset(MegatronDataset):
