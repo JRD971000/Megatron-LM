@@ -182,7 +182,13 @@ class Gemma4SelfAttention(SelfAttention):
         backend = self.config.gemma4_attention_backend
 
         if backend == "eager":
-            if packed_seq_params is not None and not allow_eager_packed:
+            # The escape can come from the keyword-only forward arg (tests / negative
+            # control) OR the config flag (training opt-in wired by the SFT script for
+            # single-document packing; see gemma4_config.gemma4_allow_eager_packed).
+            allow_packed = allow_eager_packed or getattr(
+                self.config, "gemma4_allow_eager_packed", False
+            )
+            if packed_seq_params is not None and not allow_packed:
                 # R3: the eager additive-mask path attends across the full [s, s]
                 # grid and cannot block cross-document leakage. Mirror
                 # dot_product_attention.py's packed-seq refusal.
@@ -190,8 +196,9 @@ class Gemma4SelfAttention(SelfAttention):
                     "Gemma4 eager attention backend does not support packed sequences "
                     "(packed_seq_params was provided): the additive-mask path leaks "
                     "across documents. Use gemma4_attention_backend='ffpa_flash' for "
-                    "packed SFT, or set the keyword-only allow_eager_packed=True "
-                    "(negative control only)."
+                    "packed SFT, or -- ONLY when every pack is a single document -- set "
+                    "--gemma4-allow-eager-packed (config gemma4_allow_eager_packed=True) "
+                    "or the keyword-only allow_eager_packed=True (negative control)."
                 )
             return self._gemma4_core_attention(query, key, value, attention_mask)
 

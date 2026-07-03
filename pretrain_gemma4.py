@@ -96,6 +96,15 @@ def add_gemma4_args(parser):
         "enum), which Gemma4 does not use.",
     )
     group.add_argument(
+        "--gemma4-allow-eager-packed",
+        action="store_true",
+        help="Allow the EAGER attention backend to run on packed sequences (cu_seqlens), "
+        "which it otherwise refuses (its additive-mask path leaks across documents). Safe "
+        "ONLY when every packed sequence is a SINGLE document (e.g. one conversation per "
+        "line + MBS=1) -- then the causal mask is leak-free and eager matches the tp-sp "
+        "branch's eager SFT. No effect with --gemma4-attention-backend ffpa_flash.",
+    )
+    group.add_argument(
         "--freeze-ple",
         action="store_true",
         help="Freeze the Per-Layer-Embedding table (Gemma4PLE.embed_tokens_per_layer, "
@@ -119,6 +128,7 @@ def gemma4_builder(args, pre_process, post_process, vp_stage=None, config=None, 
         # attention backend from the CLI arg here (default "eager"). This is a str, not
         # the base AttnBackend enum -> get_config_for_layer propagates it per-layer.
         config.gemma4_attention_backend = getattr(args, "gemma4_attention_backend", "eager")
+        config.gemma4_allow_eager_packed = getattr(args, "gemma4_allow_eager_packed", False)
 
     # Gemma4 MLP is a GeGLU with tanh-approx GELU. There is no CLI flag for this exact
     # combination (--swiglu is SiLU, --quick-geglu is quick_gelu), so set it here to
@@ -207,6 +217,7 @@ if __name__ == "__main__":
     # Keep the container config consistent with the builder: set the gemma4-only
     # attention backend from the CLI arg (core_transformer_config_from_args does not).
     transformer_cfg.gemma4_attention_backend = getattr(args, "gemma4_attention_backend", "eager")
+    transformer_cfg.gemma4_allow_eager_packed = getattr(args, "gemma4_allow_eager_packed", False)
     model_cfg = gpt_config_from_args(args, config=transformer_cfg)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
     pretrain(

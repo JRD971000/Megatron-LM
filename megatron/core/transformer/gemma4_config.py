@@ -57,6 +57,15 @@ class Gemma4TransformerConfig(TransformerConfig):
     # dict round-trip. The per-layer configs therefore carry ``gemma4_attention_backend``.
     gemma4_attention_backend: str = "eager"
 
+    # Escape hatch: allow the EAGER backend to run on packed sequences (cu_seqlens),
+    # which it otherwise refuses (R3 guard) because its additive-mask path attends across
+    # the whole sequence and would LEAK across documents in a multi-document pack. Set True
+    # ONLY when every packed sequence is a SINGLE document (e.g. one conversation per line
+    # + MBS=1, as in the SFT scripts) -- then the plain causal mask is leak-free and eager
+    # matches the tp-sp branch's eager SFT exactly. Default False (safe). Propagated per-layer
+    # by get_config_for_layer's re-attach loop; read by _attn_dispatch.
+    gemma4_allow_eager_packed: bool = False
+
     def __post_init__(self):
         # Sliding layers are the common case -> make them the base defaults.
         self.kv_channels = self.sliding_kv_channels
