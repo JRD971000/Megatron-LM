@@ -3,20 +3,21 @@
 
 The Gemma4TransformerBlock owns a cross-layer KV bus (producer layers 22/23 write
 post-norm/post-RoPE k/v; borrower layers 24-41 read it), so the base block's
-``_checkpointed_forward`` cannot be reused. ``_recompute_layers`` adds per-layer
-checkpointing that THREADS the bus through the checkpoint boundary (producer k/v as
-checkpoint OUTPUTS, borrower k/v as explicit checkpoint INPUTS) so borrower->producer
-gradients survive recompute. This test proves that adding recompute changes NOTHING
-numerically: same weights + same inputs, recompute OFF vs ON must give the same logits
-(forward) and the same parameter gradients (backward).
+``_checkpointed_forward`` cannot be reused. ``_recompute_layers`` runs producers
+eagerly (live k/v) and checkpoints every other layer per-layer, passing each layer's
+grad-requiring outer inputs (hidden states, the per-layer PLE slice, and -- for
+borrowers -- the producer k/v) as explicit checkpoint inputs so they are detached in
+recompute and their grads routed back once. This test proves that adding recompute
+changes NOTHING numerically: same weights + same inputs, recompute OFF vs ON must give
+the same logits (forward) and the same parameter gradients (backward).
 
 Gates:
   * a monkeypatched counter proves recompute actually ran and is PER-LAYER
-    (tensor_parallel.checkpoint called exactly num_layers times);
+    (tensor_parallel.checkpoint called once per non-producer layer);
   * eager (unpacked) is the deterministic PRIMARY gate: logits + every param grad
     match to ~bitwise (tight tol);
-  * ffpa_flash packed (the real SFT varlen path) + ffpa_flash dense match within the
-    V0 kernel-noise tolerance (flash/ffpa bwd use atomics -> not bitwise).
+  * ffpa_flash packed (the real SFT varlen path) + ffpa_flash dense (bounded by the
+    V0 kernel-noise tolerance, though observed bitwise here).
 
 Import gemma4_common FIRST (nvrx __version__ shim + sys.path) before any megatron import.
 Needs a GPU; the ffpa_flash cases additionally need ffpa_attn (PYTHONPATH=ffpa_install)
@@ -24,6 +25,12 @@ and flash_attn in the container.
 """
 import os
 import sys
+
+# The container defaults NVTE_FLASH_ATTN=0; Megatron's arg-parse normally reconciles it,
+# but this standalone test bypasses arg-parse -> unset before building so the TE backend
+# guard in language_module (attention_backend='auto') does not assert during model build.
+for _nvte in ("NVTE_FLASH_ATTN", "NVTE_FUSED_ATTN", "NVTE_UNFUSED_ATTN"):
+    os.environ.pop(_nvte, None)
 
 import pytest
 
@@ -132,14 +139,28 @@ def _worst(a, b):
     return mad, rel
 
 
-def _check(off, on, tol, tag):
+def _expected_ckpts(model):
+    """# of per-layer checkpoints = all layers EXCEPT bus-producers (run eagerly)."""
+    layers = model.decoder.layers
+    borrowed = {
+        l.self_attention.layer_type for l in layers if l.self_attention.is_kv_shared_layer
+    }
+    producers = sum(
+        1
+        for l in layers
+        if l.self_attention.store_full_length_kv and l.self_attention.layer_type in borrowed
+    )
+    return len(layers) - producers
+
+
+def _check(off, on, tol, tag, expected_ckpts):
     logits_off, grads_off, cnt_off = off
     logits_on, grads_on, cnt_on = on
 
     # recompute must have actually run, per-layer, only in the ON pass.
     assert cnt_off == 0, f"{tag}: recompute OFF still called checkpoint {cnt_off}x"
-    assert cnt_on == NUM_LAYERS, (
-        f"{tag}: expected {NUM_LAYERS} per-layer checkpoints, got {cnt_on}"
+    assert cnt_on == expected_ckpts, (
+        f"{tag}: expected {expected_ckpts} per-layer checkpoints, got {cnt_on}"
     )
 
     lm, lr = _worst(logits_on, logits_off)
@@ -198,7 +219,7 @@ def test_recompute_parity_eager_unpacked():
     ids, pos, _ = _unpacked_inputs()
     off = _run(model, ids, pos, None, recompute=False)
     on = _run(model, ids, pos, None, recompute=True)
-    _check(off, on, TOL_EAGER, "eager.unpacked")
+    _check(off, on, TOL_EAGER, "eager.unpacked", _expected_ckpts(model))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
@@ -208,7 +229,7 @@ def test_recompute_parity_ffpa_dense():
     ids, pos, _ = _unpacked_inputs(b=1, s=48)
     off = _run(model, ids, pos, None, recompute=False)
     on = _run(model, ids, pos, None, recompute=True)
-    _check(off, on, TOL_KERNEL, "ffpa.dense")
+    _check(off, on, TOL_KERNEL, "ffpa.dense", _expected_ckpts(model))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
@@ -218,8 +239,10 @@ def test_recompute_parity_ffpa_packed():
     ids, pos, psp = _packed_inputs()
     off = _run(model, ids, pos, psp, recompute=False)
     on = _run(model, ids, pos, psp, recompute=True)
-    _check(off, on, TOL_KERNEL, "ffpa.packed")
+    _check(off, on, TOL_KERNEL, "ffpa.packed", _expected_ckpts(model))
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v", "-s"]))
+    # --noconftest: skip the repo conftest (it tries to download /opt/data test assets
+    # and sets NVTE_FLASH_ATTN=0). Mirrors the other gemma4 unit tests.
+    sys.exit(pytest.main([__file__, "-v", "-s", "--noconftest"]))

@@ -92,62 +92,80 @@ class Gemma4TransformerBlock(TransformerBlock):
         The cross-layer KV bus is the reason the base block's ``_checkpointed_forward``
         cannot be reused: a *producer* layer (``store_full_length_kv``; layer 22 sliding,
         layer 23 full in E4B) writes its post-norm/post-RoPE ``(k, v)`` into the bus, and
-        *borrower* layers (``is_kv_shared_layer``; 24-41) read it. If a producer were
-        checkpointed the ordinary way, its ``(k, v)`` would be captured from the *no-grad*
-        recompute-forward and land in the bus with ``requires_grad=False`` -- silently
-        dropping every borrower->producer KV-share gradient (the exact grads the port
-        relies on: producer 23 accumulates grad from itself + 3 full borrowers, producer
-        22 from itself + 15 sliding borrowers).
+        *borrower* layers (``is_kv_shared_layer``; 24-41) read it. The borrower->producer
+        KV-share gradients (producer 23 accumulates grad from itself + 3 full borrowers,
+        producer 22 from itself + 15 sliding borrowers) must survive recompute.
 
-        Fix: make the bus tensors first-class edges of the *outer* autograd graph. Each
-        producer's ``(k, v)`` are RETURNED from its checkpoint (so they carry a real
-        ``grad_fn``), and each borrower takes its layer-type's ``(k, v)`` as explicit
-        checkpoint *inputs*. The standard autograd engine then handles the fan-in
-        (many borrowers -> one producer, accumulated once) and graph freeing exactly as
-        in the non-recompute path -- unlike closure-captured tensors, which would trigger
-        one manual backward (and buffer-free) per borrower through a shared producer.
+        Two failure modes have to be avoided together:
+
+        * If a producer were checkpointed the ordinary way, its ``(k, v)`` would be
+          captured from the *no-grad* recompute forward -> ``requires_grad=False`` ->
+          borrower->producer grads silently dropped.
+        * If a borrower checkpoint captured its producer's LIVE ``(k, v)`` via closure
+          (not as explicit inputs), each borrower's re-entrant recompute-backward would
+          traverse into the single shared producer graph and free it -> the next
+          borrower raises "backward through the graph a second time".
+
+        Chosen design:
+        * Producers run EAGERLY (not checkpointed) -> their ``(k, v)`` are live
+          outer-graph tensors, so the many-borrowers->one-producer fan-in flows through
+          the producer's normal backward exactly once, with standard grad accumulation.
+          Cost is only the 2 producer layers' retained activations.
+        * Every other layer is checkpointed per-layer. Borrowers take their type's
+          ``(k, v)`` as EXPLICIT checkpoint inputs, so the checkpoint detaches them and
+          the borrower's recompute-backward stops at those detached leaves (no traversal
+          into / double-free of the producer graph); the returned input-grads are routed
+          by the outer engine to the live producer tensors.
+
+        (Returning ``(k, v)`` as checkpoint OUTPUTS of a checkpointed producer -- a
+        multi-output re-entrant checkpoint -- was tried first and mis-handles the shared
+        k/v graph in ``CheckpointFunction`` backward; running producers eagerly is both
+        simpler and correct.)
 
         Recompute is per-layer (finest granularity). ``recompute_num_layers`` /
-        ``recompute_method`` are not sub-divided further: per-layer is already the
-        finest unit and the KV bus requires layer-aware checkpoint boundaries.
+        ``recompute_method`` are not sub-divided further: per-layer is already the finest
+        unit and the KV bus requires layer-aware checkpoint boundaries.
         """
         dsa = self.config.distribute_saved_activations
-        # layer_type -> (k, v): outer-graph tensors produced so far this forward.
+        # layer_type -> (k, v): LIVE outer-graph tensors written by eager producers.
         bus: dict = {}
         # Layer types that actually have a borrower this forward. A producer is only
-        # surfaced as a *bus* producer (its k/v returned as checkpoint outputs) if its
-        # type is borrowed -- otherwise those k/v would be dangling checkpoint outputs
-        # with no consumer, and the checkpoint backward would raise on their None grads
-        # (e.g. num_kv_shared_layers==0). Such a borrower-less producer falls through to
-        # the plain own-layer path (its k/v stay internal, exactly like non-recompute).
+        # treated as a *bus* producer (run eagerly, k/v published) if its type is
+        # borrowed -- otherwise (e.g. num_kv_shared_layers==0) it is a plain own layer
+        # whose k/v stay internal, exactly like the non-recompute path.
         borrowed_types = {
             lyr.self_attention.layer_type
             for lyr in self.layers
             if lyr.self_attention.is_kv_shared_layer
         }
 
-        def make_custom(index: int, layer_type: str, is_producer: bool):
+        def make_custom(index: int, layer_type: str):
+            """Checkpointed forward for an own OR borrower layer (single tensor output).
+
+            Every grad-REQUIRING outer tensor the layer consumes is passed as an explicit
+            checkpoint input so ``CheckpointFunction`` detaches it in recompute (and routes
+            its grad back to the outer graph once): ``hs``, the per-layer PLE slice, and --
+            for borrowers -- the producer's ``(k, v)``. The per-layer input is essential:
+            ``per_layer_inputs`` is a single live grad-requiring tensor shared by all layers,
+            so capturing its slice via closure would make each layer's recompute-backward
+            traverse (and free) the shared PLE graph -> "backward a second time" on the next
+            layer. ``attention_mask`` / ``rotary_cos_sin`` are ``requires_grad=False`` buffers,
+            so they are safe to capture via closure.
+            """
             layer = self.layers[index]
 
-            def custom_forward(hs, *bus_tensors):
-                # Borrower: rebuild its layer-type's (k, v) from the explicit inputs so
-                # the layer's forward reads them from a local (per-call) bus dict.
+            def custom_forward(hs, ple_slice, *bus_tensors):
                 local_bus: dict = {}
                 if bus_tensors:
                     local_bus[layer_type] = (bus_tensors[0], bus_tensors[1])
                 out, _ = layer(
                     hs,
                     attention_mask=attention_mask_by_type[layer_type],
-                    per_layer_input=per_layer_inputs[:, :, index, :],
+                    per_layer_input=ple_slice,
                     rotary_cos_sin=rotary_cos_sin_by_type[layer_type],
                     kv_bus=local_bus,
                     packed_seq_params=packed_seq_params,
                 )
-                if is_producer:
-                    # Surface the freshly-stored (k, v) as checkpoint OUTPUTS so they
-                    # become outer-graph edges the borrowers can depend on.
-                    k, v = local_bus[layer_type]
-                    return out, k, v
                 return out
 
             return custom_forward
@@ -155,19 +173,31 @@ class Gemma4TransformerBlock(TransformerBlock):
         for index, layer in enumerate(self.layers):
             attn = layer.self_attention
             layer_type = attn.layer_type
-            is_bus_producer = attn.store_full_length_kv and layer_type in borrowed_types
-            cf = make_custom(index, layer_type, is_bus_producer)
+            ple_slice = per_layer_inputs[:, :, index, :]
 
             if attn.is_kv_shared_layer:
-                # Borrower: pass its producer's (k, v) as explicit checkpoint inputs.
+                # Borrower: pass its producer's live (k, v) as explicit checkpoint inputs.
                 k, v = bus[layer_type]
-                hidden_states = tensor_parallel.checkpoint(cf, dsa, hidden_states, k, v)
-            elif is_bus_producer:
-                # Producer with borrowers: capture its (k, v) checkpoint outputs.
-                hidden_states, k, v = tensor_parallel.checkpoint(cf, dsa, hidden_states)
-                bus[layer_type] = (k, v)
+                hidden_states = tensor_parallel.checkpoint(
+                    make_custom(index, layer_type), dsa, hidden_states, ple_slice, k, v
+                )
+            elif attn.store_full_length_kv and layer_type in borrowed_types:
+                # Producer with borrowers: run EAGERLY so its (k, v) stay live in the
+                # outer graph (single, correct producer backward under grad fan-in).
+                local_bus: dict = {}
+                hidden_states, _ = layer(
+                    hidden_states,
+                    attention_mask=attention_mask_by_type[layer_type],
+                    per_layer_input=ple_slice,
+                    rotary_cos_sin=rotary_cos_sin_by_type[layer_type],
+                    kv_bus=local_bus,
+                    packed_seq_params=packed_seq_params,
+                )
+                bus[layer_type] = local_bus[layer_type]
             else:
                 # Own layer (or borrower-less producer): plain per-layer checkpoint.
-                hidden_states = tensor_parallel.checkpoint(cf, dsa, hidden_states)
+                hidden_states = tensor_parallel.checkpoint(
+                    make_custom(index, layer_type), dsa, hidden_states, ple_slice
+                )
 
         return hidden_states
