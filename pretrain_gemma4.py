@@ -95,6 +95,16 @@ def add_gemma4_args(parser):
         "Flash sliding). Distinct from the base --attention-backend (TE's AttnBackend "
         "enum), which Gemma4 does not use.",
     )
+    group.add_argument(
+        "--freeze-ple",
+        action="store_true",
+        help="Freeze the Per-Layer-Embedding table (Gemma4PLE.embed_tokens_per_layer, "
+        "~2.8B params). It is a plain nn.Embedding REPLICATED on every TP rank (not "
+        "VocabParallel), so training it costs a full fp32 main-grad buffer (~11GB) + "
+        "Adam state (~8.5GB) PER RANK. Freezing it (requires_grad=False before the "
+        "distributed optimizer is built) frees ~20GB static -- the difference between "
+        "OOM and fitting a long SEQLEN. Recommended for SFT (PLE is a base lookup table).",
+    )
     return parser
 
 
@@ -164,6 +174,18 @@ def gemma4_builder(args, pre_process, post_process, vp_stage=None, config=None, 
         vp_stage=vp_stage,
         pg_collection=pg_collection,
     )
+
+    # Optionally freeze the Per-Layer-Embedding table. Done HERE (before the optimizer /
+    # DDP grad buffers are built in pretrain()) so the distributed optimizer skips these
+    # params entirely -- no grad buffer, no Adam state -> frees ~20GB/rank. The PLE table
+    # is a plain nn.Embedding replicated across TP, so this is the single biggest static win.
+    if getattr(args, "freeze_ple", False) and hasattr(model, "ple"):
+        n_frozen = 0
+        for p in model.ple.parameters():
+            p.requires_grad_(False)
+            n_frozen += p.numel()
+        print_rank_0(f"  froze PLE (model.ple): {n_frozen/1e9:.2f}B params requires_grad=False")
+
     return model
 
 
