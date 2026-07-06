@@ -2,6 +2,7 @@
 
 import atexit
 import json
+import os
 from collections import Counter
 from typing import Any, Dict, Optional
 
@@ -41,6 +42,21 @@ def _strip_none(obj):
 class SFTLowLevelDataset:
     """The low-level dataset loading jsonl data for SFT
 
+    Reads the jsonl directly via a byte-offset index (seek + json.loads per row)
+    instead of ``datasets.load_dataset("json", ...)``. The Arrow-backed loader is
+    unusable for real tool-calling corpora: Arrow unifies one schema over the whole
+    file and (a) fails outright on mixed-type fields (e.g. a tool-schema ``const``
+    that is a string in one record and a number in another:
+    "Column(...anyOf/[]/const) changed from string to number"), (b) injects null
+    fields into every record (union of all keys), and (c) needs tens of GB of RAM
+    and cache to generate the split for a 30GB+ file. The offset index costs one
+    sequential scan, is cached next to the jsonl (``<path>.idx.npy``), and rows
+    round-trip byte-exact.
+
+    ``_strip_none`` is still applied on read: real data legitimately carries null
+    fields (e.g. ``"content": null`` on tool-call-only assistant turns) that the
+    chat template cannot render.
+
     Args:
         dataset_path (str): The path to jsonl data
             Each line of the jsonl must have key "messages" (List[Dict]),
@@ -57,26 +73,59 @@ class SFTLowLevelDataset:
     """
 
     def __init__(self, dataset_path: str) -> None:
+        self._path = dataset_path
+        self._offsets = self._load_or_build_index(dataset_path)
+        self._handles: Dict[int, Any] = {}  # pid -> file handle (fork/worker safe)
+
+    @staticmethod
+    def _load_or_build_index(dataset_path: str) -> np.ndarray:
+        """Byte offset of every line start; cached as <path>.idx.npy.
+
+        The cache is only reused when newer than the jsonl. Concurrent builders
+        (multiple ranks) all compute identical content and publish via atomic
+        rename, so races are benign.
+        """
+        idx_path = dataset_path + ".idx.npy"
         try:
-            from datasets import load_dataset
-        except ImportError:
-            raise ImportError(
-                "SFTDataset currently requires datasets library to be installed"
-            )
-        self.dataset = load_dataset("json", data_files=dataset_path, split="all")
+            if os.path.getmtime(idx_path) >= os.path.getmtime(dataset_path):
+                return np.load(idx_path)
+        except OSError:
+            pass
+        offsets = []
+        pos = 0
+        with open(dataset_path, "rb") as f:
+            for line in f:
+                offsets.append(pos)
+                pos += len(line)
+        arr = np.array(offsets, dtype=np.int64)
+        try:
+            tmp = f"{idx_path}.{os.getpid()}.tmp.npy"
+            np.save(tmp, arr)
+            os.replace(tmp, idx_path)
+        except OSError:
+            pass  # read-only location etc. -- index just isn't cached
+        return arr
+
+    def _row(self, idx: int) -> Dict[str, Any]:
+        pid = os.getpid()
+        handle = self._handles.get(pid)
+        if handle is None:
+            handle = open(self._path, "rb")
+            self._handles[pid] = handle
+        handle.seek(int(self._offsets[idx]))
+        return json.loads(handle.readline())
 
     def __len__(self) -> int:
-        return len(self.dataset)
+        return len(self._offsets)
 
     def __getitem__(self, idx: int) -> list:
-        # Strip datasets-injected null keys (Arrow schema unification) so the chat
-        # template renders the original per-record structure -- see _strip_none.
-        return _strip_none(self.dataset[idx]["messages"])
+        # Strip null-valued keys so the chat template renders the original
+        # per-record structure -- see _strip_none.
+        return _strip_none(self._row(idx)["messages"])
 
     def get_tools(self, idx: int) -> Optional[list]:
         """Return the optional per-record tool definitions (or None)."""
-        row = self.dataset[idx]
-        return _strip_none(row.get("tools"))
+        return _strip_none(self._row(idx).get("tools"))
 
     def get_tools_per_conversation(self, idx: int) -> Optional[list]:
         """Return the optional per-conversation tool definitions (or None).
@@ -88,8 +137,7 @@ class SFTLowLevelDataset:
         (a tool list or None) applies to conversation ``i`` only. Takes precedence
         over the row-level ``tools`` key when present.
         """
-        row = self.dataset[idx]
-        return _strip_none(row.get("tools_per_conversation"))
+        return _strip_none(self._row(idx).get("tools_per_conversation"))
 
 
 class SFTDataset(MegatronDataset):
