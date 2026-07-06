@@ -67,11 +67,11 @@ def _apply_te_fused_adam_int32_shim():
     negative and the kernel launches zero blocks: FusedAdam SILENTLY SKIPS the
     update (verified standalone: a 2.82B-element param sees no change after
     step()). Gemma4 hits this when training the PLE table
-    (embed_tokens_per_layer, 262144 x 10752 = 2.82B params, replicated across
-    TP) with DP=1 (e.g. TP=8 on one node) -- the distributed optimizer then
-    cannot shard the main grad/param below 2**31. The l2-grad-norm variant of
-    the same bug crashes with an illegal memory access in get_grad_norm_fp32
-    (fixed in megatron/core/optimizer/clip_grads.py).
+    (embed_tokens_per_layer, 262144 x 10752 = 2.82B params) whenever a rank's
+    shard exceeds 2**31-1 elements: with the table vocab-sharded over TP the
+    shard is 2.82B/TP, so TP=1 with DP=1 still overflows (TP>=2 does not). The
+    l2-grad-norm variant of the same bug crashes with an illegal memory access
+    in get_grad_norm_fp32 (fixed in megatron/core/optimizer/clip_grads.py).
 
     Wrap fused_adam's multi_tensor_applier to split every oversized tensor into
     <2**31-element flat views, applied consistently across all tensor lists.
@@ -164,11 +164,11 @@ def add_gemma4_args(parser):
         "--freeze-ple",
         action="store_true",
         help="Freeze the Per-Layer-Embedding table (Gemma4PLE.embed_tokens_per_layer, "
-        "~2.8B params). It is a plain nn.Embedding REPLICATED on every TP rank (not "
-        "VocabParallel), so training it costs a full fp32 main-grad buffer (~11GB) + "
-        "Adam state (~8.5GB) PER RANK. Freezing it (requires_grad=False before the "
-        "distributed optimizer is built) frees ~20GB static -- the difference between "
-        "OOM and fitting a long SEQLEN. Recommended for SFT (PLE is a base lookup table).",
+        "~2.8B params, VocabParallelEmbedding sharded over TP). Training it costs "
+        "fp32 main-grad + Adam state proportional to 2.8B/TP per rank (~20GB at "
+        "TP=1, ~2.5GB at TP=8). Freezing it (requires_grad=False before the "
+        "distributed optimizer is built) removes that entirely. Recommended for SFT "
+        "(PLE is a base lookup table).",
     )
     return parser
 

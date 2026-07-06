@@ -118,11 +118,13 @@ class Gemma4Model(GPTModel):
             full_base=self.config.full_rotary_base,
         )
         self.ple = Gemma4PLE(
+            config=self.config,
             hidden_size=self.config.hidden_size,
             num_layers=self.config.num_layers,
             ple_dim=self.config.hidden_size_per_layer_input,
             vocab_size_per_layer_input=self.config.vocab_size_per_layer_input,
             eps=self.config.layernorm_epsilon,
+            tp_group=self.pg_collection.tp,
         )
 
     def forward(
