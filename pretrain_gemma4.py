@@ -58,6 +58,62 @@ def _apply_nvrx_version_shim():
 
 _apply_nvrx_version_shim()
 
+
+def _apply_te_fused_adam_int32_shim():
+    """Make TE FusedAdam correct for params with numel > 2**31 - 1.
+
+    TE's multi-tensor kernels store each tensor's numel in a 32-bit int
+    (TensorListMetadata.sizes), so a tensor above 2**31 - 1 elements wraps
+    negative and the kernel launches zero blocks: FusedAdam SILENTLY SKIPS the
+    update (verified standalone: a 2.82B-element param sees no change after
+    step()). Gemma4 hits this when training the PLE table
+    (embed_tokens_per_layer, 262144 x 10752 = 2.82B params, replicated across
+    TP) with DP=1 (e.g. TP=8 on one node) -- the distributed optimizer then
+    cannot shard the main grad/param below 2**31. The l2-grad-norm variant of
+    the same bug crashes with an illegal memory access in get_grad_norm_fp32
+    (fixed in megatron/core/optimizer/clip_grads.py).
+
+    Wrap fused_adam's multi_tensor_applier to split every oversized tensor into
+    <2**31-element flat views, applied consistently across all tensor lists.
+    All fused_adam multi-tensor ops are elementwise across aligned lists, so
+    the split is mathematically exact and in-place semantics are preserved
+    (views share storage).
+    """
+    limit = 2**31 - 1
+    chunk = 2**30
+    try:
+        import transformer_engine.pytorch.optimizers.fused_adam as _fa
+    except Exception:
+        return
+    inner = _fa.multi_tensor_applier
+    if getattr(inner, "_int32_split_shim", False):
+        return
+
+    def _split_applier(op, noop_flag, tensor_lists, *args):
+        if not any(t.numel() > limit for t in tensor_lists[0]):
+            return inner(op, noop_flag, tensor_lists, *args)
+        out_lists = [[] for _ in tensor_lists]
+        for i, first in enumerate(tensor_lists[0]):
+            numel = first.numel()
+            assert all(lst[i].numel() == numel for lst in tensor_lists), (
+                "multi-tensor lists are not elementwise-aligned; cannot split "
+                "an oversized tensor safely"
+            )
+            if numel <= limit:
+                for li, lst in enumerate(tensor_lists):
+                    out_lists[li].append(lst[i])
+            else:
+                for li, lst in enumerate(tensor_lists):
+                    assert lst[i].is_contiguous()
+                    out_lists[li].extend(lst[i].view(-1).split(chunk))
+        return inner(op, noop_flag, out_lists, *args)
+
+    _split_applier._int32_split_shim = True
+    _fa.multi_tensor_applier = _split_applier
+
+
+_apply_te_fused_adam_int32_shim()
+
 from functools import partial
 
 import torch

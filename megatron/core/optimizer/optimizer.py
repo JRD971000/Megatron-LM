@@ -48,7 +48,12 @@ from ..dist_checkpointing.optimizer import (
 from ..dist_checkpointing.utils import add_prefix_for_sharding
 from ..transformer.module import param_is_not_shared
 from ..utils import log_single_rank
-from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
+from .clip_grads import (
+    _split_int32_oversized_tensors,
+    clip_grad_by_total_norm_fp32,
+    count_zeros_fp32,
+    get_grad_norm_fp32,
+)
 from .grad_scaler import MegatronGradScaler
 from .optimizer_config import OptimizerConfig
 
@@ -87,6 +92,10 @@ def _multi_tensor_copy_this_to_that(
     """
     if overflow_buf is not None:
         overflow_buf.fill_(0)
+        # Split >2**31-1-element tensors into aligned flat views (int32 multi-
+        # tensor kernel limit; oversized tensors otherwise silently no-op).
+        this = _split_int32_oversized_tensors(this)
+        that = _split_int32_oversized_tensors(that)
         # Scaling with factor `1.0` is equivalent to copy.
         multi_tensor_applier(multi_tensor_scale_impl, overflow_buf, [this, that], 1.0)
     else:

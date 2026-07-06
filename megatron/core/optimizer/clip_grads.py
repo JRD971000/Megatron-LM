@@ -51,6 +51,36 @@ from ..tensor_parallel import param_is_not_tensor_parallel_duplicate
 from ..transformer.module import param_is_not_shared
 from ..utils import get_data_parallel_group_if_dtensor, to_local_if_dtensor
 
+# TE/Apex multi-tensor kernels store each tensor's numel in a 32-bit int
+# (TensorListMetadata.sizes); a tensor with numel > 2**31 - 1 wraps negative and
+# the kernel reads/writes out of bounds (observed: CUDA illegal memory access in
+# multi_tensor_l2norm on a 2.82B-element replicated-embedding main grad at DP=1,
+# where the distributed optimizer cannot shard it below 2**31).
+_MULTI_TENSOR_INT32_NUMEL_LIMIT = 2**31 - 1
+_MULTI_TENSOR_SPLIT_CHUNK = 2**30
+
+
+def _split_int32_oversized_tensors(tensors: List[torch.Tensor]) -> List[torch.Tensor]:
+    """Split tensors too large for the int32 multi-tensor kernels into views.
+
+    Returns flat sub-views (< 2**31 elements each) sharing the original storage,
+    so in-place ops (scale) still hit the real tensor and reductions (l2 norm)
+    are exact. Returns the input list unchanged when nothing is oversized.
+    """
+    if all(t.numel() <= _MULTI_TENSOR_INT32_NUMEL_LIMIT for t in tensors):
+        return tensors
+    split = []
+    for t in tensors:
+        if t.numel() <= _MULTI_TENSOR_INT32_NUMEL_LIMIT:
+            split.append(t)
+            continue
+        assert t.is_contiguous(), (
+            "cannot split a non-contiguous tensor with numel > 2**31-1 for the "
+            "int32 multi-tensor kernels"
+        )
+        split.extend(t.view(-1).split(_MULTI_TENSOR_SPLIT_CHUNK))
+    return split
+
 
 def get_grad_norm_fp32(
     grads_for_norm: Union[List[torch.Tensor], torch.Tensor],
@@ -114,7 +144,9 @@ def get_grad_norm_fp32(
                 grad_norm, _ = multi_tensor_applier(
                     l2_norm_impl,
                     dummy_overflow_buf,
-                    [grads_for_norm],
+                    # Split >2**31-1-element grads into views (int32 kernel limit);
+                    # exact for the whole-list norm computed here.
+                    [_split_int32_oversized_tensors(grads_for_norm)],
                     False,  # no per-parameter norm
                 )
             else:
@@ -182,6 +214,9 @@ def clip_grad_by_total_norm_fp32(
     # Scale.
     clip_coeff = max_norm / (total_norm + 1.0e-6)
     dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')
+    # Split >2**31-1-element grads into views (int32 kernel limit); the scale is
+    # elementwise in-place on views of the same storage, so this is exact.
+    grads = _split_int32_oversized_tensors(grads)
     if isinstance(clip_coeff, torch.Tensor):
         clip_coeff.clamp_max_(1.0)
         assert (
