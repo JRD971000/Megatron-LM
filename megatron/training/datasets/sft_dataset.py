@@ -78,6 +78,19 @@ class SFTLowLevelDataset:
         row = self.dataset[idx]
         return _strip_none(row.get("tools"))
 
+    def get_tools_per_conversation(self, idx: int) -> Optional[list]:
+        """Return the optional per-conversation tool definitions (or None).
+
+        Pre-packed rows (see examples/gemma4/pack_sft_dataset.py) concatenate
+        conversations from different source records, each with its own tools. Such
+        rows carry a ``tools_per_conversation`` list aligned with the conversations
+        obtained by splitting ``messages`` on system-role messages; element ``i``
+        (a tool list or None) applies to conversation ``i`` only. Takes precedence
+        over the row-level ``tools`` key when present.
+        """
+        row = self.dataset[idx]
+        return _strip_none(row.get("tools_per_conversation"))
+
 
 class SFTDataset(MegatronDataset):
     """The dataset used during SFT"""
@@ -129,7 +142,20 @@ class SFTDataset(MegatronDataset):
         # Optional per-record tool definitions (used by tool-calling chat templates,
         # e.g. the Gemma4 assistant-masked format).
         tools = self.dataset.get_tools(row_idx) if hasattr(self.dataset, "get_tools") else None
+        # Pre-packed rows carry per-conversation tools (element i applies to
+        # conversation i); they take precedence over the row-level ``tools``.
+        tools_per_conversation = (
+            self.dataset.get_tools_per_conversation(row_idx)
+            if hasattr(self.dataset, "get_tools_per_conversation")
+            else None
+        )
         split_conversations = self._split_conversations(merged_conversations)
+        if tools_per_conversation is not None:
+            assert len(tools_per_conversation) == len(split_conversations), (
+                f"tools_per_conversation has {len(tools_per_conversation)} entries but "
+                f"messages split into {len(split_conversations)} conversations "
+                f"(row {row_idx})"
+            )
 
         def extend_with_padding(tokens, targets, positions, pad_len):
             tokens.extend([pad] * pad_len)
@@ -143,10 +169,15 @@ class SFTDataset(MegatronDataset):
         eod = tokenizer.eod
         pad = tokenizer.pad
         # TODO(duncan): Track number of convs dropped and/or truncated and amount of end-padding
-        for conversation in split_conversations:
+        for conv_idx, conversation in enumerate(split_conversations):
 
+            conv_tools = (
+                tools_per_conversation[conv_idx]
+                if tools_per_conversation is not None
+                else tools
+            )
             tokens, targets = tokenizer.tokenize_conversation(
-                conversation, return_target=True, add_generation_prompt=False, tools=tools
+                conversation, return_target=True, add_generation_prompt=False, tools=conv_tools
             )
 
             tokens_list = tokens.tolist()
@@ -173,6 +204,16 @@ class SFTDataset(MegatronDataset):
 
             # Handle any necessary truncation
             if len(pack_tokens) >= pack_length + 1:  # +1 here to account for later alignment
+                # A packer-merged row (carries tools_per_conversation) is sized to fit
+                # sequence_length by construction; overflowing here means the packer ran
+                # with a different --seq-length or --pad-granularity (must be
+                # 2*context_parallel_size) than this training config. Truncating would
+                # silently drop the tail conversations' supervised tokens, so fail loudly.
+                assert tools_per_conversation is None, (
+                    f"pre-packed row {row_idx} overflows sequence_length={pack_length} at "
+                    f"train time (packed with a different --seq-length or a "
+                    f"--pad-granularity != 2*context_parallel_size?)"
+                )
                 # Truncate on the right
                 max_body = pack_length
                 pack_tokens = pack_tokens[:max_body]

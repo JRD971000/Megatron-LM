@@ -165,6 +165,10 @@ if [ "${USE_BACKEND_FLAG}" = "1" ]; then
     export PYTHONPATH=${FFPA_INSTALL}:${MLM}:${PYTHONPATH:-}
   fi
 fi
+
+# ---- extra CLI passthrough (e.g. EXTRA_OPTS="--recompute-granularity full \
+# ---- --recompute-method uniform --recompute-num-layers 1" for long seqlen) --
+options="${options} ${EXTRA_OPTS:-}"
 export PYTHONPATH=${MLM}:${PYTHONPATH:-}
 cd ${MLM}
 
