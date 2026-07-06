@@ -32,8 +32,8 @@ are passed through unmodified as single-row bins and counted in the stats.
 
 cd /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/ataghibakhsh/Gemma4_mlm/Megatron-LM-ffpa
 python3 examples/gemma4/pack_sft_dataset.py \
-  --input  ../code_dev/shared-state/sft_run/octopus_subset_512.jsonl \
-  --output ../code_dev/shared-state/sft_run/octopus_subset_512_packed_8192.jsonl \
+  --input  /lustre/fsw/portfolios/llmservice/users/ameyasunilm/datasets/tool_calling_with_execution/tool_calling_past_octopus-05152026-reasoning_on-raw_messages_format.jsonl \
+  --output ../code_dev/shared-state/sft_run/tool_calling_past_octopus-05152026-reasoning_on-raw_messages_format_packed_8192.jsonl \
   --tokenizer-model /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/ataghibakhsh/gemma4-playground/weights/gemma-4-E4B-it \
   --prompt-format gemma --seq-length 8192 --num-workers 8 --verify 32
 
@@ -99,6 +99,25 @@ def build_tokenizer(tokenizer_model: str, prompt_format: str):
     )
 
 
+def strip_none(obj):
+    """Recursively drop dict keys whose value is None.
+
+    MUST stay in sync with megatron/training/datasets/sft_dataset.py::_strip_none
+    (replicated here so worker processes need no megatron import before the
+    tokenizer is built). The training loader applies this to every row before
+    tokenizing (datasets/Arrow null-injection cleanup), and real tool-calling
+    data carries e.g. ``"content": null`` on tool-call-only assistant turns --
+    tokenizing the RAW record instead crashes the chat template with
+    'can only concatenate str (not "NoneType")'. All packer-side tokenization
+    must therefore go through this stripped view to match train time.
+    """
+    if isinstance(obj, dict):
+        return {k: strip_none(v) for k, v in obj.items() if v is not None}
+    if isinstance(obj, list):
+        return [strip_none(v) for v in obj]
+    return obj
+
+
 def split_conversations(messages: List[Dict]) -> List[List[Dict]]:
     """Split merged messages on system-role boundaries.
 
@@ -153,7 +172,9 @@ class _Worker:
         """Return (record_idx, per-conversation token lengths, packable, error)."""
         record_idx, line = payload
         try:
-            record = json.loads(line)
+            # Tokenize the STRIPPED view -- identical to what the training loader
+            # sees (see strip_none). The output file still gets the original line.
+            record = strip_none(json.loads(line))
             messages = record["messages"]
             conversations = split_conversations(messages)
             if not conversations:
@@ -244,41 +265,51 @@ def _progress(done: int, total: int) -> None:
         print(f"\r[measure] {done}/{total} records tokenized", end="", flush=True)
 
 
-def first_fit_decreasing(
-    items: List[Tuple[int, int]],  # (record_idx, effective_row_length)
+def best_fit_decreasing(
+    items: List[Tuple[int, int]],  # (record_idx, cost)
     capacity: int,
-    pad_granularity: int,
-    row_lengths: Dict[int, List[int]],
 ) -> List[List[int]]:
-    """FFD over whole records (a record's conversations stay together).
+    """Best-fit-decreasing over whole records, O(N log N)-ish via residual buckets.
 
-    Bin feasibility replays the loader's accumulation: after each conversation
-    the running total is rounded up to ``pad_granularity`` (the loader's
-    context-parallel padding); the total must never exceed ``capacity``. The
-    round-up accumulation is a left fold, so a bin's load extends incrementally
-    from its current load without re-folding the whole bin.
+    A record's cost is the sum of ``round_up(conv_len, pad_granularity)`` over its
+    conversations. This is EXACTLY the loader's accumulation: the running total is
+    always a multiple of the granularity, so ``round_up(cum + len) == cum +
+    round_up(len)`` -- costs are additive and bin feasibility is a plain sum.
+
+    Residuals are bounded integers in [0, capacity], so open bins are kept in
+    per-residual buckets with a small sorted index of nonempty residuals; each
+    placement is a bisect + O(#distinct residuals) update instead of a scan over
+    all bins (the naive first-fit scan is O(N * bins) -- hours at millions of
+    records). Deterministic: items sorted by (cost desc, record_idx), LIFO buckets.
     """
-
-    def extend_load(load: int, record_idx: int) -> int:
-        for conv_len in row_lengths[record_idx]:
-            load = round_up(load + conv_len, pad_granularity)
-        return load
+    import bisect
 
     bins: List[List[int]] = []
-    bin_loads: List[int] = []
-    # Sort by length desc; ties by record index for determinism.
-    for record_idx, _ in sorted(items, key=lambda x: (-x[1], x[0])):
-        placed = False
-        for bin_idx in range(len(bins)):
-            new_load = extend_load(bin_loads[bin_idx], record_idx)
-            if new_load <= capacity:
-                bins[bin_idx].append(record_idx)
-                bin_loads[bin_idx] = new_load
-                placed = True
-                break
-        if not placed:
+    buckets: Dict[int, List[int]] = {}  # residual -> [bin_id, ...] (LIFO)
+    avail: List[int] = []  # sorted distinct residuals with nonempty buckets
+
+    for record_idx, cost in sorted(items, key=lambda x: (-x[1], x[0])):
+        pos = bisect.bisect_left(avail, cost)
+        if pos < len(avail):
+            residual = avail[pos]  # tightest bin that fits (best fit)
+            bucket = buckets[residual]
+            bin_id = bucket.pop()
+            if not bucket:
+                del buckets[residual]
+                avail.pop(pos)
+            bins[bin_id].append(record_idx)
+            new_residual = residual - cost
+        else:
+            bin_id = len(bins)
             bins.append([record_idx])
-            bin_loads.append(extend_load(0, record_idx))
+            new_residual = capacity - cost
+        if new_residual > 0:
+            bucket = buckets.get(new_residual)
+            if bucket is None:
+                buckets[new_residual] = [bin_id]
+                bisect.insort(avail, new_residual)
+            else:
+                bucket.append(bin_id)
     return bins
 
 
@@ -324,6 +355,7 @@ def verify_output(
     seq_length: int,
     pad_granularity: int,
     num_rows: int,
+    merged_cap: int = 512,
 ) -> None:
     """Re-read the OUTPUT through the training loader's datasets/Arrow path and
     assert token identity vs clean-JSON tokenization + capacity feasibility.
@@ -354,9 +386,18 @@ def verify_output(
             else:
                 other_rows.append(row_idx)
     step = max(1, len(other_rows) // num_rows) if num_rows > 0 else 1
-    rows_to_check = sorted(set(merged_rows) | set(other_rows[::step]))
-    print(f"[verify] checking all {len(merged_rows)} merged bins + "
-          f"{len(rows_to_check) - len(merged_rows)} sampled other rows "
+    if merged_cap > 0 and len(merged_rows) > merged_cap:
+        # Explicit cap for huge outputs (re-tokenizing every merged bin twice is
+        # O(days) at millions of rows); evenly-spaced sample, never silent.
+        mstep = max(1, len(merged_rows) // merged_cap)
+        merged_selected = merged_rows[::mstep]
+        print(f"[verify] CAPPED: checking {len(merged_selected)} of "
+              f"{len(merged_rows)} merged bins (--verify-merged-cap {merged_cap})")
+    else:
+        merged_selected = merged_rows
+    rows_to_check = sorted(set(merged_selected) | set(other_rows[::step]))
+    print(f"[verify] checking {len(merged_selected)} merged bins + "
+          f"{len(rows_to_check) - len(merged_selected)} sampled other rows "
           f"(of {total} total)")
     checked = 0
     with open(output_path, "rb") as f:
@@ -366,8 +407,9 @@ def verify_output(
             arrow_tools_per_conv = low_level.get_tools_per_conversation(row_idx)
             arrow_tools = low_level.get_tools(row_idx)
             arrow_convs = split_conversations(arrow_messages)
-            # Path B: clean JSON view (what the packer measured).
-            clean = json.loads(_read_line(f, offsets[row_idx]))
+            # Path B: clean JSON view (what the packer measured; stripped like
+            # the loader strips -- see strip_none).
+            clean = strip_none(json.loads(_read_line(f, offsets[row_idx])))
             clean_convs = split_conversations(clean["messages"])
             clean_tools_per_conv = clean.get("tools_per_conversation")
             clean_tools = clean.get("tools")
@@ -445,6 +487,14 @@ def main() -> None:
     parser.add_argument("--verify", type=int, default=32, metavar="N",
                         help="re-check ~N output rows through the datasets/Arrow "
                              "training path (0 = skip)")
+    parser.add_argument("--verify-merged-cap", type=int, default=512,
+                        help="max merged bins to re-verify (evenly sampled; 0 = all). "
+                             "Re-tokenizing every merged bin is O(days) on huge outputs")
+    parser.add_argument("--on-error", choices=["abort", "drop"], default="abort",
+                        help="records that fail tokenization: abort (default) or drop "
+                             "them from the output with a loud count. NOTE such records "
+                             "would crash the training loader identically, so dropping "
+                             "is the only trainable option for dirty data")
     args = parser.parse_args()
 
     if args.pad_granularity == 1:
@@ -462,16 +512,27 @@ def main() -> None:
     )
 
     errors = [(i, err) for i, _, _, err in results if err]
+    failed_ids = set()
     if errors:
         for i, err in errors[:5]:
             print(f"[pack] ERROR record {i}: {err}", file=sys.stderr)
-        raise SystemExit(f"{len(errors)} records failed to tokenize; aborting")
+        if args.on_error == "abort":
+            raise SystemExit(
+                f"{len(errors)} records failed to tokenize; aborting "
+                f"(use --on-error drop to exclude them -- they would crash the "
+                f"training loader identically)"
+            )
+        failed_ids = {i for i, _ in errors}
+        print(f"[pack] DROPPING {len(failed_ids)} records that failed tokenization "
+              f"(--on-error drop); they would crash the training loader identically")
 
     row_lengths: Dict[int, List[int]] = {}
     packable_items: List[Tuple[int, int]] = []
     passthrough: List[int] = []
     dropped: List[int] = []
     for record_idx, lengths, packable, _ in results:
+        if record_idx in failed_ids:
+            continue
         row_lengths[record_idx] = lengths
         cum = 0
         for conv_len in lengths:
@@ -486,9 +547,7 @@ def main() -> None:
         else:
             packable_items.append((record_idx, cum))
 
-    bins = first_fit_decreasing(
-        packable_items, args.seq_length, args.pad_granularity, row_lengths
-    )
+    bins = best_fit_decreasing(packable_items, args.seq_length)
 
     n_convs = sum(len(v) for v in row_lengths.values())
     total_tokens = sum(sum(v) for v in row_lengths.values())
@@ -513,7 +572,8 @@ def main() -> None:
     if args.verify > 0:
         tokenizer = build_tokenizer(args.tokenizer_model, args.prompt_format)
         verify_output(
-            args.output, tokenizer, args.seq_length, args.pad_granularity, args.verify
+            args.output, tokenizer, args.seq_length, args.pad_granularity,
+            args.verify, merged_cap=args.verify_merged_cap,
         )
 
 
