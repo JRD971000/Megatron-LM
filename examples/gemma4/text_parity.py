@@ -19,16 +19,15 @@ import torch
 import functools
 
 HF_WEIGHTS = (
-    "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/ataghibakhsh/"
-    "gemma4-playground/weights/gemma-4-E4B-it"
+    "/lustre/fsw/portfolios/coreai/users/ataghibakhsh/Gemma4_mlm/checkpoints/HF/gemma-4-E4B"
 )
 MLM_SRC = (
     "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/ataghibakhsh/"
-    "Gemma4_mlm/Megatron-LM"
+    "Gemma4_mlm/Megatron-LM-ffpa"
 )
 MLM_CKPT = (
-    "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/ataghibakhsh/"
-    "Gemma4_mlm/code_dev/shared-state/implementations/HYBRID-gemma4-mlm/mlm_ckpt"
+    "/lustre/fsw/portfolios/coreai/users/ataghibakhsh/Gemma4_mlm/checkpoints/MLM/gemma-4-E4B-base-mlm"
+
 )
 DEFAULT_TEXT = "What is the capital of France? Answer in one word."
 

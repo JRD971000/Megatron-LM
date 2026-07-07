@@ -22,6 +22,17 @@ Run with container python:
     python3 mlm_to_hf_convert.py --no-forward         # weight test only
     python3 mlm_to_hf_convert.py --save-dir /path/hf  # also write a loadable HF ckpt
 
+Trained/SFT checkpoints (e.g. Megatron training iter_XXXXXXX dirs, incl. ones with
+distributed-optimizer state — only model weights are read, optimizer state is dropped):
+    python3 mlm_to_hf_convert.py --trained \
+        --mlm-ckpt /path/to/checkpoints/<run>/iter_0000200 \
+        --hf-ref-dir /path/to/ground-truth-hf-ckpt \
+        --save-dir /path/to/hf-export
+In --trained mode weight-value diffs vs the reference are expected; export is gated on
+structure (all keys present, shapes match) and forward sanity on finite logits. Aux
+files (config, tokenizer, chat_template.jinja, ...) + vision tensors come from
+--hf-ref-dir verbatim.
+
 With --save-dir, a full from_pretrained-loadable HF checkpoint is written: the text
 tower comes from the MLM dist-checkpoint (verified bitwise first), the vision tower
 and all aux files (config.json, tokenizer*, chat_template, generation_config) are
@@ -73,8 +84,14 @@ HF_WORKER_FLAG = "--_hf-worker"
 # Phase 1 helpers: load MLM ckpt + reverse conversion
 # ---------------------------------------------------------------------------
 
-def load_mlm_model():
-    """Build Gemma4Model (local spec, E4B dims) and load the dist-checkpoint into it."""
+def load_mlm_model(mlm_ckpt=MLM_CKPT):
+    """Build Gemma4Model (local spec, E4B dims) and load the dist-checkpoint into it.
+
+    Works for both the flat conversion checkpoint (mlm_ckpt) and Megatron *training*
+    checkpoints (iter_XXXXXXX dirs): we request only the model's sharded_state_dict,
+    so any optimizer/rng/args entries in a training checkpoint are simply not read
+    (i.e. optimizer states are dropped for free).
+    """
     from megatron.core import dist_checkpointing
     from megatron.core.models.gemma4.gemma4_layer_specs import get_gemma4_layer_local_spec
 
@@ -82,9 +99,9 @@ def load_mlm_model():
     model = _build_model(get_gemma4_layer_local_spec, config, vocab=262144)
     model.eval()
 
-    print(f"[MLM] loading dist-checkpoint from {MLM_CKPT} ...", flush=True)
+    print(f"[MLM] loading dist-checkpoint from {mlm_ckpt} ...", flush=True)
     sharded_sd = model.sharded_state_dict()
-    loaded = dist_checkpointing.load(sharded_sd, MLM_CKPT)
+    loaded = dist_checkpointing.load(sharded_sd, mlm_ckpt)
     model.load_state_dict(loaded, strict=False)
     return model, config
 
@@ -252,7 +269,7 @@ def export_hf_checkpoint(hf_recovered, orig_file, orig_dir, save_dir):
 # Phase 2: HF forward worker (gemma4_venv subprocess)
 # ---------------------------------------------------------------------------
 
-def _hf_forward_worker(weights_pt_path, out_path):
+def _hf_forward_worker(weights_pt_path, out_path, hf_dir=HF_WEIGHTS_DIR):
     """Runs ONLY in the gemma4_venv subprocess.
 
     1. Load original HF model.
@@ -269,7 +286,7 @@ def _hf_forward_worker(weights_pt_path, out_path):
 
     print("[HF worker] loading original HF model...", flush=True)
     model = Gemma4ForConditionalGeneration.from_pretrained(
-        HF_WEIGHTS_DIR, torch_dtype=torch.bfloat16, attn_implementation="eager"
+        hf_dir, torch_dtype=torch.bfloat16, attn_implementation="eager"
     ).eval().to(device)
 
     with torch.no_grad():
@@ -312,14 +329,35 @@ def main():
     ap.add_argument("--save-dir", default=None,
                     help="write a standalone from_pretrained-loadable HF checkpoint here "
                          "(text tower from MLM, vision tower + aux files from original)")
-    ap.add_argument(HF_WORKER_FLAG, nargs=2, metavar=("WEIGHTS_PT", "OUT_PT"), dest="hf_worker",
-                    help=argparse.SUPPRESS)
+    ap.add_argument("--mlm-ckpt", default=MLM_CKPT,
+                    help="MLM dist-checkpoint dir. Training checkpoints (iter_XXXXXXX) with "
+                         "optimizer state are fine: only model weights are read, optimizer "
+                         "states are dropped.")
+    ap.add_argument("--hf-ref-dir", default=HF_WEIGHTS_DIR,
+                    help="ground-truth HF checkpoint dir: source of aux files (config, "
+                         "tokenizer, chat_template.jinja, generation_config, ...), of the "
+                         "non-text tensors (vision tower), and the comparison reference")
+    ap.add_argument("--trained", action="store_true",
+                    help="the MLM checkpoint is a trained/SFT checkpoint: weight VALUE "
+                         "differences vs the reference are EXPECTED, so gate the export "
+                         "only on structural checks (all keys present, shapes match) and "
+                         "report how many tensors changed. Forward parity becomes "
+                         "informational (gated on finite logits, not bitwise equality).")
+    ap.add_argument("--results-out", default=RESULTS_OUT,
+                    help="where to write the markdown results summary")
+    ap.add_argument(HF_WORKER_FLAG, nargs=3, metavar=("WEIGHTS_PT", "OUT_PT", "HF_DIR"),
+                    dest="hf_worker", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     # --- subprocess entry point ---
     if args.hf_worker:
-        _hf_forward_worker(args.hf_worker[0], args.hf_worker[1])
+        _hf_forward_worker(args.hf_worker[0], args.hf_worker[1], args.hf_worker[2])
         return
+
+    hf_ref_dir = args.hf_ref_dir.rstrip("/")
+    hf_ref_file = os.path.join(hf_ref_dir, "model.safetensors")
+    if not os.path.isfile(hf_ref_file):
+        sys.exit(f"[ERROR] reference safetensors not found: {hf_ref_file}")
 
     # -------------------------------------------------------------------------
     # Phase 1: load MLM checkpoint + reverse conversion + bitwise compare
@@ -329,31 +367,44 @@ def main():
     print("="*60)
 
     _init_distributed()
-    model, config = load_mlm_model()
+    model, config = load_mlm_model(args.mlm_ckpt)
 
     print("[convert] building HF state_dict (reverse conversion)...", flush=True)
     hf_sd = build_hf_state_dict(model, config)
     print(f"[convert] recovered {len(hf_sd)} HF tensors", flush=True)
 
-    print("[compare] bitwise comparison against original HF safetensors...", flush=True)
-    rows, n_mismatch, n_skip = bitwise_compare(hf_sd, HF_WEIGHTS_FILE)
+    print("[compare] bitwise comparison against reference HF safetensors...", flush=True)
+    rows, n_mismatch, n_skip = bitwise_compare(hf_sd, hf_ref_file)
     n_checked = len(rows) - n_skip
+    n_shape = sum(1 for _, s, _ in rows if s == "SHAPE_MISMATCH")
+    n_value = sum(1 for _, s, _ in rows if s == "VALUE_MISMATCH")
+    n_equal = sum(1 for _, s, _ in rows if s == "EQUAL")
     all_eq = n_mismatch == 0
+    struct_ok = (n_shape == 0 and n_skip == 0)
 
-    print(f"[compare] {n_checked} tensors checked, {n_mismatch} mismatch, {n_skip} skipped")
-    print(f"[compare] V_MLM2HF_W: {'PASS' if all_eq else 'FAIL'}")
+    if args.trained:
+        export_ok = struct_ok
+        print(f"[compare] trained mode: {n_checked} tensors checked | "
+              f"{n_value} differ from reference (expected for SFT) | "
+              f"{n_equal} unchanged | {n_shape} shape mismatches | {n_skip} unplaceable")
+        print(f"[compare] V_MLM2HF_STRUCT: {'PASS' if struct_ok else 'FAIL'}")
+    else:
+        export_ok = all_eq
+        print(f"[compare] {n_checked} tensors checked, {n_mismatch} mismatch, {n_skip} skipped")
+        print(f"[compare] V_MLM2HF_W: {'PASS' if all_eq else 'FAIL'}")
 
     # -------------------------------------------------------------------------
     # Export: write a standalone HF checkpoint (only if the weight check passed).
     # -------------------------------------------------------------------------
     if args.save_dir:
-        if not all_eq:
-            print("[export] SKIPPED: weight bitwise check FAILED; refusing to write checkpoint.")
+        if not export_ok:
+            print("[export] SKIPPED: weight check FAILED "
+                  f"({'structural' if args.trained else 'bitwise'}); refusing to write checkpoint.")
         else:
             print("\n" + "="*60)
             print(f"Export: writing HF checkpoint -> {args.save_dir}")
             print("="*60)
-            export_hf_checkpoint(hf_sd, HF_WEIGHTS_FILE, HF_WEIGHTS_DIR, args.save_dir)
+            export_hf_checkpoint(hf_sd, hf_ref_file, hf_ref_dir, args.save_dir)
 
     # Save recovered weights for Phase 2
     _, weights_pt = tempfile.mkstemp(suffix="_mlm2hf_weights.pt")
@@ -373,7 +424,7 @@ def main():
         env = os.environ.copy()
         env.pop("PYTHONPATH", None)
         result = subprocess.run(
-            [GEMMA4_VENV_PYTHON, __file__, HF_WORKER_FLAG, weights_pt, out_pt],
+            [GEMMA4_VENV_PYTHON, __file__, HF_WORKER_FLAG, weights_pt, out_pt, hf_ref_dir],
             env=env,
         )
         try:
@@ -407,45 +458,81 @@ def main():
         lc = fwd_result["logits_conv"].float()
         fwd_bitwise = torch.equal(lo, lc)
         fwd_max_diff = (lo - lc).abs().max().item()
+        fwd_finite = bool(torch.isfinite(lc).all())
         go = fwd_result["greedy_orig"]
         gc = fwd_result["greedy_conv"]
         greedy_match = torch.equal(go, gc)
-        fwd_pass = fwd_bitwise
+        # Trained ckpt: logits are EXPECTED to differ from the reference model;
+        # the gate is that the converted model produces finite (non-NaN/inf) logits.
+        fwd_pass = fwd_finite if args.trained else fwd_bitwise
         fwd_detail = (
             f"bitwise={'YES' if fwd_bitwise else 'NO'}  "
-            f"max_logit_diff={fwd_max_diff:.2e}  "
-            f"greedy_match={greedy_match}  "
-            f"orig_next={go[0,-1].item()}  conv_next={gc[0,-1].item()}"
+            f"finite={'YES' if fwd_finite else 'NO'}  "
+            f"max_logit_diff_vs_ref={fwd_max_diff:.2e}  "
+            f"greedy_match_vs_ref={greedy_match}  "
+            f"ref_next={go[0,-1].item()}  conv_next={gc[0,-1].item()}"
         )
-        print(f"  V_MLM2HF_F (forward parity): {'PASS' if fwd_pass else 'FAIL'}  {fwd_detail}")
+        label = "forward sanity (trained)" if args.trained else "forward parity"
+        print(f"  V_MLM2HF_F ({label}): {'PASS' if fwd_pass else 'FAIL'}  {fwd_detail}")
 
-    print(f"  V_MLM2HF_W (weight bitwise): {'PASS' if all_eq else 'FAIL'}  "
-          f"({n_checked} checked, {n_mismatch} mismatch)")
+    if args.trained:
+        print(f"  V_MLM2HF_STRUCT (weight structure): {'PASS' if struct_ok else 'FAIL'}  "
+              f"({n_checked} checked, {n_value} changed by training, {n_equal} unchanged, "
+              f"{n_shape} shape mismatch, {n_skip} unplaceable)")
+    else:
+        print(f"  V_MLM2HF_W (weight bitwise): {'PASS' if all_eq else 'FAIL'}  "
+              f"({n_checked} checked, {n_mismatch} mismatch)")
 
     # Write markdown results
     lines = [
         "# V_RESULTS_MLM2HF — MLM->HF reverse conversion + parity",
         "",
-        "## V_MLM2HF_W — weight bitwise match (MLM dist-ckpt -> HF safetensors)",
-        "",
-        f"- Tensors checked: **{n_checked}**  |  Mismatches: **{n_mismatch}**  |  Skipped: **{n_skip}**",
-        f"- **RESULT: {'PASS (all recovered weights bitwise-equal to original HF)' if all_eq else 'FAIL'}**",
+        f"- MLM checkpoint: `{args.mlm_ckpt}`",
+        f"- HF reference:   `{hf_ref_dir}`",
+        f"- Mode: {'trained (SFT) — value diffs vs reference expected' if args.trained else 'round-trip — bitwise required'}",
         "",
     ]
-    if n_mismatch > 0:
-        lines += ["### Mismatches", ""]
-        for k, s, d in rows:
-            if s not in ("EQUAL", "SKIP"):
-                lines.append(f"- `{k}`: {s} — {d}")
-        lines.append("")
+    if args.trained:
+        lines += [
+            "## V_MLM2HF_STRUCT — weight structural match",
+            "",
+            f"- Tensors checked: **{n_checked}**  |  Changed by training: **{n_value}**  |  "
+            f"Unchanged: **{n_equal}**  |  Shape mismatches: **{n_shape}**  |  Unplaceable: **{n_skip}**",
+            f"- **RESULT: {'PASS (all keys present, all shapes match)' if struct_ok else 'FAIL'}**",
+            "",
+        ]
+        if not struct_ok:
+            lines += ["### Structural problems", ""]
+            for k, s, d in rows:
+                if s in ("SHAPE_MISMATCH", "SKIP"):
+                    lines.append(f"- `{k}`: {s} — {d}")
+            lines.append("")
+    else:
+        lines += [
+            "## V_MLM2HF_W — weight bitwise match (MLM dist-ckpt -> HF safetensors)",
+            "",
+            f"- Tensors checked: **{n_checked}**  |  Mismatches: **{n_mismatch}**  |  Skipped: **{n_skip}**",
+            f"- **RESULT: {'PASS (all recovered weights bitwise-equal to original HF)' if all_eq else 'FAIL'}**",
+            "",
+        ]
+        if n_mismatch > 0:
+            lines += ["### Mismatches", ""]
+            for k, s, d in rows:
+                if s not in ("EQUAL", "SKIP"):
+                    lines.append(f"- `{k}`: {s} — {d}")
+            lines.append("")
 
     if fwd_result is not None:
+        fwd_title = ("forward sanity (converted SFT weights in HF: finite logits)"
+                     if args.trained else "forward parity (original HF == converted-weights HF)")
+        fwd_pass_msg = (("PASS (finite logits)" if args.trained else "PASS (bitwise-identical logits)")
+                        if fwd_pass else "FAIL")
         lines += [
-            "## V_MLM2HF_F — forward parity (original HF == converted-weights HF)",
+            f"## V_MLM2HF_F — {fwd_title}",
             "",
             f"- FIXED_TOKENS = {FIXED_TOKENS}",
             f"- {fwd_detail}",
-            f"- **RESULT: {'PASS (bitwise-identical logits)' if fwd_pass else 'FAIL'}**",
+            f"- **RESULT: {fwd_pass_msg}**",
             "",
         ]
     else:
@@ -456,11 +543,12 @@ def main():
             "",
         ]
 
-    with open(RESULTS_OUT, "w") as f:
+    os.makedirs(os.path.dirname(args.results_out) or ".", exist_ok=True)
+    with open(args.results_out, "w") as f:
         f.write("\n".join(lines))
-    print(f"\nWROTE {RESULTS_OUT}")
+    print(f"\nWROTE {args.results_out}")
 
-    overall = all_eq and (fwd_pass is True or fwd_pass is None)
+    overall = export_ok and (fwd_pass is True or fwd_pass is None)
     print(f"\nOVERALL: {'PASS' if overall else 'FAIL'}")
     sys.exit(0 if overall else 1)
 
