@@ -17,23 +17,29 @@ IGNORE_INDEX = -100
 
 
 def _strip_none(obj):
-    """Recursively drop dict keys whose value is None.
+    """Recursively drop dict keys whose value is None -- EXCEPT inside
+    ``tool_calls[].function.arguments`` subtrees.
 
-    ``datasets.load_dataset("json", ...)`` builds a single Arrow schema for the whole
-    file, so nested structs are UNIFIED across every row AND across every element of a
-    list. For tool-calling data this means each entry of ``tools`` receives the UNION of
-    all tools' ``parameters.properties`` keys, with the ones that don't belong to that
-    tool filled as ``None`` (e.g. a 2-property tool becomes 78 properties, 76 of them
-    null). The chat template renders that null-filled union, bloating the prompt ~6x and
-    pushing the assistant (supervised) tokens past ``seq_length`` -- they then get
-    right-truncated away, leaving an all-``IGNORE_INDEX`` target (zero loss, zero grad).
+    Raw tool-calling data legitimately carries null message fields (e.g.
+    ``"content": null`` on tool-call-only assistant turns) that the chat template
+    cannot render ('can only concatenate str (not "NoneType")'), so nulls are
+    pruned: for the template an absent key and a ``None`` key are equivalent (it
+    uses ``.get(...)``).
 
-    For the chat template an absent key and a ``None`` key are equivalent (it uses
-    ``.get(...)``), and tool-schema properties / message fields are never legitimately
-    ``None``, so pruning null values restores the exact per-record structure.
+    Null VALUES inside a tool call's ``arguments`` dict are different: they are
+    semantic argument values. The HF reference pipeline never strips them and the
+    ground-truth chat template renders them via jinja stringification
+    (``city:None``), so stripping there would silently drop supervised argument
+    keys from the training target. The ``arguments`` subtree is therefore
+    preserved verbatim. MUST stay in sync with
+    examples/gemma4/pack_sft_dataset.py::strip_none.
     """
     if isinstance(obj, dict):
-        return {k: _strip_none(v) for k, v in obj.items() if v is not None}
+        return {
+            k: (v if k == "arguments" else _strip_none(v))
+            for k, v in obj.items()
+            if v is not None
+        }
     if isinstance(obj, list):
         return [_strip_none(v) for v in obj]
     return obj

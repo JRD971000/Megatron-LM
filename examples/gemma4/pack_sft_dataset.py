@@ -112,10 +112,52 @@ def strip_none(obj):
     must therefore go through this stripped view to match train time.
     """
     if isinstance(obj, dict):
-        return {k: strip_none(v) for k, v in obj.items() if v is not None}
+        # Preserve tool-call ``arguments`` subtrees verbatim: null values there
+        # are SEMANTIC (the ground-truth template renders them as ``key:None``);
+        # stripping would drop supervised argument keys from the target.
+        return {
+            k: (v if k == "arguments" else strip_none(v))
+            for k, v in obj.items()
+            if v is not None
+        }
     if isinstance(obj, list):
         return [strip_none(v) for v in obj]
     return obj
+
+
+def normalize_tool_call_arguments(record: Dict) -> int:
+    """Parse JSON-string ``tool_calls[].function.arguments`` into dicts, in place.
+
+    OpenAI-style data stores arguments as a JSON-ENCODED STRING. The Gemma4 chat
+    template branches on the type (sft_tokenizer.py: ``arguments is mapping`` ->
+    native ``call:name{key:value,...}`` rendering; ``is string`` -> VERBATIM
+    passthrough), so string arguments train the model to emit raw JSON inside
+    the call braces -- e.g. ``call:f{{"a": 1}}`` instead of ``call:f{a:1}`` --
+    which the eval-side parser cannot decode (observed as ~0 AST scores on
+    BFCL). Returns the number of argument strings converted. Strings that do
+    not parse to a JSON object are left untouched.
+    """
+    n_ok = 0
+    n_bad = 0
+    for message in record.get("messages") or []:
+        for tool_call in message.get("tool_calls") or []:
+            function = tool_call.get("function")
+            if isinstance(function, dict) and isinstance(function.get("arguments"), str):
+                try:
+                    value = json.loads(function["arguments"])
+                except (ValueError, TypeError):
+                    n_bad += 1  # unparseable -> would render verbatim (broken grammar)
+                    continue
+                if isinstance(value, dict):
+                    function["arguments"] = value
+                    n_ok += 1
+                else:
+                    # Parses to list/scalar/str (incl. double-encoded JSON): the
+                    # template would dump it verbatim -- the exact failure mode
+                    # this normalization removes. Flag as a record error so the
+                    # --on-error policy (abort/drop) handles it loudly.
+                    n_bad += 1
+    return n_ok, n_bad
 
 
 def split_conversations(messages: List[Dict]) -> List[List[Dict]]:
@@ -162,10 +204,12 @@ class _Worker:
 
     tokenizer = None
     args = None
+    normalize_tool_args = True
 
     @classmethod
-    def init(cls, tokenizer_model: str, prompt_format: str) -> None:
+    def init(cls, tokenizer_model: str, prompt_format: str, normalize_tool_args: bool = True) -> None:
         cls.tokenizer = build_tokenizer(tokenizer_model, prompt_format)
+        cls.normalize_tool_args = normalize_tool_args
 
     @classmethod
     def measure(cls, payload: Tuple[int, str]) -> Tuple[int, List[int], bool, str]:
@@ -174,7 +218,19 @@ class _Worker:
         try:
             # Tokenize the STRIPPED view -- identical to what the training loader
             # sees (see strip_none). The output file still gets the original line.
-            record = strip_none(json.loads(line))
+            record = json.loads(line)
+            if cls.normalize_tool_args:
+                _, n_bad_args = normalize_tool_call_arguments(record)
+                if n_bad_args:
+                    return (
+                        record_idx,
+                        [],
+                        False,
+                        f"{n_bad_args} tool-call argument string(s) do not parse to a "
+                        "JSON object (list/scalar/double-encoded/unparseable) -- "
+                        "verbatim template rendering would train the broken call grammar",
+                    )
+            record = strip_none(record)
             messages = record["messages"]
             conversations = split_conversations(messages)
             if not conversations:
@@ -227,6 +283,7 @@ def measure_all(
     tokenizer_model: str,
     prompt_format: str,
     num_workers: int,
+    normalize_tool_args: bool = True,
 ) -> List[Tuple[int, List[int], bool, str]]:
     """Tokenize every record and return per-conversation lengths."""
 
@@ -237,7 +294,7 @@ def measure_all(
 
     results: List[Optional[Tuple[int, List[int], bool, str]]] = [None] * len(offsets)
     if num_workers <= 1:
-        _Worker.init(tokenizer_model, prompt_format)
+        _Worker.init(tokenizer_model, prompt_format, normalize_tool_args)
         for payload in payloads():
             res = _Worker.measure(payload)
             results[res[0]] = res
@@ -249,7 +306,7 @@ def measure_all(
         with ctx.Pool(
             processes=num_workers,
             initializer=_Worker.init,
-            initargs=(tokenizer_model, prompt_format),
+            initargs=(tokenizer_model, prompt_format, normalize_tool_args),
         ) as pool:
             done = 0
             for res in pool.imap_unordered(_Worker.measure, payloads(), chunksize=8):
@@ -319,23 +376,47 @@ def write_output(
     offsets: List[int],
     bins: List[List[int]],
     passthrough: List[int],
-) -> None:
-    """Write packed bins + passthrough rows (original line, unmodified)."""
+    normalize_tool_args: bool = True,
+) -> int:
+    """Write packed bins + passthrough rows.
+
+    Unchanged rows keep their line content verbatim (modulo trailing-newline
+    shape) UNLESS tool-call argument normalization
+    changed them (see normalize_tool_call_arguments) -- the output file must
+    contain the normalized form the lengths were measured on. Returns the
+    number of normalized argument strings across all written rows.
+    """
+    n_normalized = 0
+
+    def _single_row_line(fin, record_idx: int) -> str:
+        nonlocal n_normalized
+        line = _read_line(fin, offsets[record_idx])
+        if normalize_tool_args:
+            record = json.loads(line)
+            n, _ = normalize_tool_call_arguments(record)
+            if n:
+                n_normalized += n
+                return json.dumps(record, ensure_ascii=False) + "\n"
+        return line.rstrip("\n") + "\n"
+
     with open(input_path, "rb") as fin, open(output_path, "w") as fout:
         for bin_records in bins:
             if len(bin_records) == 1:
-                # Single-record bin: keep the original row byte-identical
-                # (avoids touching rows that gained nothing from packing).
-                fout.write(_read_line(fin, offsets[bin_records[0]]).rstrip("\n") + "\n")
+                fout.write(_single_row_line(fin, bin_records[0]))
                 continue
             messages: List[Dict] = []
             tools_per_conversation: List[Any] = []
             for record_idx in bin_records:
                 record = json.loads(_read_line(fin, offsets[record_idx]))
-                convs = split_conversations(record["messages"])
+                if normalize_tool_args:
+                    n_normalized += normalize_tool_call_arguments(record)[0]
+                # Derive conversation/tool metadata from the STRIPPED view (what
+                # measure/train see); write the unstripped messages.
+                meta_record = strip_none(record)
+                convs = split_conversations(meta_record["messages"])
                 messages.extend(record["messages"])
                 tools_per_conversation.extend(
-                    _tools_for_conversations(record, len(convs))
+                    _tools_for_conversations(meta_record, len(convs))
                 )
             # Always write the key for merged rows (even all-None) so that
             # downstream tooling can distinguish packer-merged rows from
@@ -346,7 +427,8 @@ def write_output(
             }
             fout.write(json.dumps(row, ensure_ascii=False) + "\n")
         for record_idx in passthrough:
-            fout.write(_read_line(fin, offsets[record_idx]).rstrip("\n") + "\n")
+            fout.write(_single_row_line(fin, record_idx))
+    return n_normalized
 
 
 def verify_output(
@@ -490,6 +572,12 @@ def main() -> None:
     parser.add_argument("--verify-merged-cap", type=int, default=512,
                         help="max merged bins to re-verify (evenly sampled; 0 = all). "
                              "Re-tokenizing every merged bin is O(days) on huge outputs")
+    parser.add_argument("--no-normalize-tool-args", action="store_true",
+                        help="disable parsing JSON-string tool_calls[].function.arguments "
+                             "into dicts (see normalize_tool_call_arguments: string "
+                             "arguments render VERBATIM in the chat template and train "
+                             "the model to emit raw JSON inside call braces -> ~0 AST "
+                             "eval scores). Normalization is ON by default")
     parser.add_argument("--on-error", choices=["abort", "drop"], default="abort",
                         help="records that fail tokenization: abort (default) or drop "
                              "them from the output with a loud count. NOTE such records "
@@ -507,8 +595,10 @@ def main() -> None:
     offsets = _index_lines(args.input)
     print(f"[pack] {len(offsets)} records")
 
+    normalize_tool_args = not args.no_normalize_tool_args
     results = measure_all(
-        args.input, offsets, args.tokenizer_model, args.prompt_format, args.num_workers
+        args.input, offsets, args.tokenizer_model, args.prompt_format,
+        args.num_workers, normalize_tool_args=normalize_tool_args,
     )
 
     errors = [(i, err) for i, _, _, err in results if err]
@@ -566,7 +656,12 @@ def main() -> None:
           f"vs {len(offsets)} rows before packing "
           f"({total_tokens / max(1, len(offsets) * args.seq_length):.1%} full)")
 
-    write_output(args.input, args.output, offsets, bins, passthrough)
+    n_normalized = write_output(
+        args.input, args.output, offsets, bins, passthrough,
+        normalize_tool_args=normalize_tool_args,
+    )
+    print(f"[pack] normalized {n_normalized} JSON-string tool-call arguments -> dicts "
+          f"(native template rendering); disable with --no-normalize-tool-args")
     print(f"[pack] wrote {args.output}")
 
     if args.verify > 0:
